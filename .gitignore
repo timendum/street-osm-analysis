@@ -14,3 +14,4 @@ wheels/
 *.db-shm
 *.osm
 *.osm.pbf
+*.png

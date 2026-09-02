@@ -1,10 +1,11 @@
 """Command-line interface for the Italian Street Extractor.
 
-Exposes two subcommands, ``extract`` and ``join``, each with its own options.
-This module owns argument parsing (:func:`parse_args`) and the derivation of the
-default database path (:func:`default_database_path`). The per-command
-orchestration (``run_extract`` / ``run_join``) lives in later tasks; only their
-signatures are declared here so callers can import a stable surface.
+Exposes the ``extract``, ``join``, ``threshold``, ``prefixes``, and ``map``
+subcommands, each with its own options. This module owns argument parsing
+(:func:`parse_args`), the derivation of default output paths
+(:func:`default_database_path`, :func:`default_map_output_path`), and the
+per-command orchestration (``run_extract`` / ``run_join`` / ``run_threshold`` /
+``run_prefixes`` / ``run_map``).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from strade.joiner import (
     join_group,
     print_candidate_pairs,
 )
+from strade.mapper import build_grid, render_map
 from strade.parser import parse_highways
 from strade.prefixes import format_counts, scan_first_words
 from strade.reporter import Reporter
@@ -51,6 +53,18 @@ DEFAULT_THRESHOLD_M = 100.0
 
 # Number of highest-count street groups printed to stdout after a join.
 TOP_STREET_GROUPS = 10
+
+# Default square grid cell edge length for the `map` command, in kilometers.
+DEFAULT_CELL_KM = 10.0
+
+# Default minimum street count for a `map` grid cell to be plotted; cells below
+# this are dropped so a handful of streets cannot produce an extreme ratio.
+# 42 = floor((0.98/0.15)^2): the samples a cell needs for its share to be good
+# to +-0.15 at 95% confidence (worst-case p=0.5 binomial margin of error).
+DEFAULT_MIN_STREETS = 42
+
+# Image suffix appended to the derived default `map` output path.
+MAP_SUFFIX = ".png"
 
 
 @dataclass(frozen=True)
@@ -109,6 +123,40 @@ class PrefixesOptions:
 
     input_path: Path  # OSM dump to scan
     verbosity: int  # reporter verbosity level (incremented per -v)
+
+
+@dataclass(frozen=True)
+class MapOptions:
+    """Resolved options for the ``map`` command.
+
+    Reads the ``streets``/``ways`` tables from a database that ``join`` has
+    already populated and renders a density-normalized prominence map for
+    ``target``: each square grid cell is coloured by the share of its streets
+    whose ``norm_name`` equals ``target``, so the result is not merely a map of
+    street density. ``target`` must be a normalization key (as produced by
+    ``join``), not a display name, so bilingual/prefix variants count together.
+    ``output_path`` defaults to the database path with a ``.png`` extension.
+    ``cell_km`` is the grid cell edge in kilometers; ``min_streets`` drops cells
+    with fewer than that many streets so sparse cells cannot dominate the scale.
+    """
+
+    database_path: Path  # SQLite checkpoint produced by `extract` + `join`
+    target: str  # norm_name whose per-cell share is mapped
+    output_path: Path  # image file to write
+    cell_km: float  # grid cell edge length in kilometers
+    min_streets: int  # minimum streets for a cell to be plotted
+    verbosity: int  # reporter verbosity level (incremented per -v)
+
+
+def default_map_output_path(database_path: Path, target: str) -> Path:
+    """Derive the default ``map`` image path from the database path and target.
+
+    Concatenates the database file's stem with the target ``norm_name`` and a
+    ``.png`` extension, keeping the file in the database's directory, so mapping
+    different targets from one database yields distinct files
+    (``aosta.db`` + ``roma`` -> ``aosta-roma.png``).
+    """
+    return database_path.with_name(f"{database_path.stem}-{target}{MAP_SUFFIX}")
 
 
 def default_database_path(input_path: Path) -> Path:
@@ -254,12 +302,62 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to the OSM dump to scan (.osm.pbf, .osm, ...).",
     )
 
+    # map: plot a density-normalized prominence map for a target norm_name.
+    map_cmd = subparsers.add_parser(
+        "map",
+        parents=[common],
+        help=(
+            "Plot where a street name is proportionally most common: each grid "
+            "cell is coloured by the share of its streets carrying the target "
+            "norm_name, so the map is not just a map of street density."
+        ),
+    )
+    map_cmd.add_argument(
+        "database",
+        type=Path,
+        help="Path to the SQLite checkpoint produced by `extract` and `join`.",
+    )
+    map_cmd.add_argument(
+        "target",
+        help="The norm_name (grouping key, not display name) to map the share of.",
+    )
+    map_cmd.add_argument(
+        "-o",
+        "--output",
+        dest="output",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the image to write. Defaults to the database path with a "
+            ".png extension."
+        ),
+    )
+    map_cmd.add_argument(
+        "--cell",
+        dest="cell",
+        metavar="KM",
+        type=float,
+        default=DEFAULT_CELL_KM,
+        help="Square grid cell edge length in kilometers (default: 10).",
+    )
+    map_cmd.add_argument(
+        "--min-streets",
+        dest="min_streets",
+        metavar="N",
+        type=int,
+        default=DEFAULT_MIN_STREETS,
+        help=(
+            "Drop grid cells with fewer than N streets so sparse cells do not "
+            "produce extreme ratios (default: 42)."
+        ),
+    )
+
     return parser
 
 
 def parse_args(
     argv: list[str],
-) -> ExtractOptions | JoinOptions | ThresholdOptions | PrefixesOptions:
+) -> ExtractOptions | JoinOptions | ThresholdOptions | PrefixesOptions | MapOptions:
     """Parse command-line arguments into resolved options.
 
     Dispatches on the subcommand and returns :class:`ExtractOptions` for
@@ -287,6 +385,17 @@ def parse_args(
 
     if args.command == "prefixes":
         return PrefixesOptions(input_path=args.input, verbosity=args.verbosity)
+
+    if args.command == "map":
+        output = args.output or default_map_output_path(args.database, args.target)
+        return MapOptions(
+            database_path=args.database,
+            target=args.target,
+            output_path=output,
+            cell_km=args.cell,
+            min_streets=args.min_streets,
+            verbosity=args.verbosity,
+        )
 
     if args.command == "threshold":
         return ThresholdOptions(
@@ -537,6 +646,79 @@ def run_prefixes(options: PrefixesOptions, reporter: Reporter) -> int:
     return reporter.exit_code
 
 
+def run_map(options: MapOptions, reporter: Reporter) -> int:
+    """Run the ``map`` command; returns the process exit code.
+
+    Streams the produced streets from the database as representative points via
+    :func:`~strade.store.read_street_points`, bins them into a square metric grid
+    with :func:`~strade.mapper.build_grid` (colouring each cell by the share of
+    its streets whose ``norm_name`` equals ``options.target``), and renders the
+    grid to ``options.output_path`` with :func:`~strade.mapper.render_map`.
+
+    The ``target`` is matched against each street's ``norm_name`` exactly, so it
+    must be the grouping key produced by ``join``; a target that matches nothing
+    still renders a valid map (every cell simply has a zero share) and is flagged
+    as a warning so the caller notices a likely wrong key. When no cell clears
+    the ``min_streets`` floor the map is still written, with a placeholder note,
+    and a warning is recorded. Progress and the output path go to stderr via the
+    reporter, keeping stdout unused. The run terminates with ``0`` when no
+    non-fatal warnings were recorded, else a non-zero code.
+    """
+    cell_size_m = options.cell_km * 1000.0
+    reporter.progress(
+        f"map: binning streets into {options.cell_km:g} km cells "
+        f"(min {options.min_streets} streets/cell)"
+    )
+    # street count sizes the bar; it is an upper bound since streets with no
+    # resolved coords are skipped by read_street_points. Drawn on stderr like
+    # the join/threshold bars.
+    total_streets = store.count_streets(options.database_path)
+    # Resolve the dominant human-readable name for the target key so the plot
+    # labels read "Via Roma" rather than the lossy "roma"; fall back to the key
+    # when nothing matches (an empty/wrong-key map still renders).
+    display_name = store.read_display_name(options.database_path, options.target)
+    points = tqdm(
+        store.read_street_points(options.database_path),
+        desc="mapping streets",
+        total=total_streets,
+        unit="street",
+    )
+    grid = build_grid(
+        points,
+        target=options.target,
+        cell_size=cell_size_m,
+        min_streets=options.min_streets,
+        display_name=display_name,
+    )
+
+    if grid.total_streets == 0:
+        reporter.warn(
+            f"no streets found in {options.database_path}; "
+            "has `join` been run on this database?"
+        )
+    elif grid.matching_streets == 0:
+        reporter.warn(
+            f"no streets matched norm_name '{options.target}'; "
+            "check the key (use the norm_name from `join`, not a display name)"
+        )
+    scored = sum(1 for cell in grid.cells if cell.populated)
+    sparse = len(grid.cells) - scored
+    if scored == 0 and grid.total_streets:
+        reporter.warn(
+            f"no grid cell reached the min-streets floor of {options.min_streets}; "
+            "lower --min-streets or increase --cell"
+        )
+
+    render_map(grid, options.output_path)
+    reporter.progress(
+        f"map: {grid.matching_streets}/{grid.total_streets} streets matched, "
+        f"{scored} cell(s) scored, {sparse} too sparse -> {options.output_path}"
+    )
+
+    # 0 when no non-fatal warnings were recorded, else non-zero.
+    return reporter.exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     """Console entry point: parse args and dispatch to the matching command.
 
@@ -556,6 +738,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_prefixes(options, reporter)
         if isinstance(options, ThresholdOptions):
             return run_threshold(options, reporter)
+        if isinstance(options, MapOptions):
+            return run_map(options, reporter)
         return run_join(options, reporter)
     except KeyboardInterrupt:
         # Ctrl-C

@@ -581,6 +581,116 @@ def _representative_name(names: list[str]) -> str:
     return max(sorted(counts), key=lambda name: counts[name])
 
 
+@dataclass(frozen=True)
+class StreetPoint:
+    """A produced street reduced to one representative geographic point.
+
+    Used by the ``map`` command, which needs only a single (lon, lat) per street
+    plus its ``norm_name`` to bin streets into a grid and compute, per cell, the
+    share that carry a target key. The point is the mean of all resolved vertices
+    of the street's composing ways (see :func:`read_street_points`), a cheap,
+    stable centroid that is accurate enough for coarse (kilometer-scale) binning.
+    """
+
+    norm_name: str
+    lon: float
+    lat: float
+
+
+def count_streets(db: Path) -> int:
+    """Return the number of rows in the ``streets`` table of ``db``.
+
+    A cheap ``COUNT(*)`` used to size the ``map`` command's progress bar before
+    :func:`read_street_points` streams the rows; it is an upper bound on the
+    points actually yielded, since streets with no resolved coordinates are
+    skipped during the stream. Opens and closes its own connection.
+    """
+    conn = connect(db)
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM streets").fetchone()
+        return int(row[0]) if row is not None else 0
+    finally:
+        conn.close()
+
+
+def read_street_points(db: Path) -> Iterator[StreetPoint]:
+    """Stream one :class:`StreetPoint` per produced street in ``db``.
+
+    Joins each row of the ``streets`` table to the ``ways`` it is composed of
+    (via the JSON ``way_ids`` list), decodes those ways' packed ``coords``, and
+    reduces them to a single representative point: the arithmetic mean of every
+    resolved vertex across the street's ways. That mean is a coarse centroid,
+    which is all the ``map`` command needs since it bins points into cells far
+    larger than any single street.
+
+    Streets are read one row at a time and only the ways of the current street
+    are held in memory, so the whole dataset is never materialized — matching the
+    streaming discipline the rest of the pipeline follows. A street whose ways
+    have no resolved coordinates (all vertices dropped for missing locations) is
+    skipped, since it cannot be placed on the map. Requires a database on which
+    ``join`` has already run to populate the ``streets`` table; a database with
+    an empty ``streets`` table simply yields nothing.
+
+    The connection is opened for the lifetime of the iterator and closed when the
+    generator is exhausted or closed, so callers should drive it to completion
+    (or close it) to release the database handle.
+    """
+    conn = connect(db)
+    try:
+        street_cursor = conn.execute("SELECT norm_name, way_ids FROM streets")
+        # A second cursor fetches each street's way coords by id. Reusing the
+        # same connection is safe: SQLite serializes the statements and the
+        # streets cursor is only advanced by the outer loop.
+        for norm_name, way_ids_json in street_cursor:
+            way_ids = json.loads(way_ids_json)
+            if not way_ids:
+                continue
+            placeholders = ",".join("?" * len(way_ids))
+            coord_rows = conn.execute(
+                f"SELECT coords FROM ways WHERE way_id IN ({placeholders})",
+                way_ids,
+            ).fetchall()
+            lon_sum = 0.0
+            lat_sum = 0.0
+            vertex_count = 0
+            for (coords_blob,) in coord_rows:
+                for ref in deserialize_coords_binary(coords_blob):
+                    lon_sum += ref.lon
+                    lat_sum += ref.lat
+                    vertex_count += 1
+            if vertex_count == 0:
+                continue
+            yield StreetPoint(
+                norm_name=norm_name,
+                lon=lon_sum / vertex_count,
+                lat=lat_sum / vertex_count,
+            )
+    finally:
+        conn.close()
+
+
+def read_display_name(db: Path, norm_name: str) -> str | None:
+    """Return the most frequent raw ``name`` among streets sharing ``norm_name``.
+
+    The ``map`` command groups streets by their lossy normalization key but wants
+    a human-readable label for the plot, so this recovers the dominant surface
+    form: the ``name`` carried by the most streets in the group (for example
+    ``Via Roma`` for the key ``roma``), ties broken by ascending name for
+    determinism. Returns ``None`` when no street carries ``norm_name`` so the
+    caller can fall back to the key. Opens and closes its own connection.
+    """
+    conn = connect(db)
+    try:
+        row = conn.execute(
+            "SELECT name FROM streets WHERE norm_name = ? "
+            "GROUP BY name ORDER BY COUNT(*) DESC, name ASC LIMIT 1",
+            (norm_name,),
+        ).fetchone()
+        return row[0] if row is not None else None
+    finally:
+        conn.close()
+
+
 class DoneSet:
     """The set of street names already fully written, backed by the ``done`` table.
 

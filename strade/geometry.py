@@ -55,6 +55,16 @@ class Projector:
             always_xy=True,
         )
 
+    def transform_point(self, lon: float, lat: float) -> tuple[float, float]:
+        """Project a single WGS84 ``(lon, lat)`` to ``(x, y)`` meters in the metric CRS.
+
+        Used where only a representative coordinate is needed rather than a full
+        way geometry (for example the ``map`` command binning street centroids
+        into a metric grid). Returns the projected ``(x, y)`` in meters.
+        """
+        x, y = self._transformer.transform(lon, lat)
+        return float(x), float(y)
+
     def to_metric_linestring(self, way: HighwayWay) -> LineString | None:
         """Build a projected shapely ``LineString`` from a way's resolved coords.
 

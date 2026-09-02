@@ -5,6 +5,7 @@ description = "Extract distinct named Italian streets from an OpenStreetMap dump
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "matplotlib>=3.9.0",
     "osmium>=4.3.1",
     "pyproj>=3.7.2",
     "shapely>=2.1.2",
