@@ -271,7 +271,7 @@ def render_map(grid: Grid, output_path: Path) -> None:
         # low as zero share but never negative).
         vmax = max(max(quotients), 1.0 + 1e-9)
         norm = TwoSlopeNorm(vmin=0.0, vcenter=1.0, vmax=vmax)
-        collection = PatchCollection(squares, cmap="coolwarm", norm=norm)
+        collection = PatchCollection(squares, cmap="YlOrBr", norm=norm)
         collection.set_array(quotients)
         ax.add_collection(collection)
 
