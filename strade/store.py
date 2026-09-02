@@ -10,10 +10,11 @@ commands. It wraps a single SQLite database (opened via the standard-library
 - ``street_groups`` — one row per norm_name: count of distinct streets sharing it.
 - ``done``    — the set of street names whose streets are fully committed.
 
-A way's geometry is stored as JSON text within its row: ``node_ids`` as a JSON
-array of ints and ``coords`` as a JSON array of ``[node_id, lon, lat]``
-triples. The raw ``name`` is stored as SQLite ``TEXT`` to preserve exact
-Unicode, including diacritics, so the human-readable name is never lossy. Each
+A way's geometry lives in two BLOB columns — ``node_ids`` and ``coords`` — which
+dominate the on-disk size and are stored in a compact, lossless binary encoding
+(see the serialization section for the format). The raw ``name`` is stored as
+SQLite ``TEXT`` to preserve exact Unicode, including diacritics, so the
+human-readable name is never lossy. Each
 row also carries a ``norm_name`` — the language- and type-agnostic grouping key
 from :func:`strade.normalize.normalize_name` — computed once at write time so the
 join-side grouped read can stream rows already ordered by that key.
@@ -33,6 +34,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import struct
+import zlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -54,8 +57,8 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         "way_id INTEGER PRIMARY KEY, "
         "name TEXT NOT NULL, "
         "norm_name TEXT NOT NULL, "
-        "node_ids TEXT NOT NULL, "
-        "coords TEXT NOT NULL)"
+        "node_ids BLOB NOT NULL, "
+        "coords BLOB NOT NULL)"
     ),
     # Ways are grouped on the normalization key (norm_name), so the streaming
     # grouped read is served by an index on (norm_name, name, way_id): equal
@@ -88,39 +91,16 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
 )
 
 
-def _migrate_streets(conn: sqlite3.Connection) -> None:
-    """Drop pre-``norm_name`` join output so the new schema can recreate it.
-
-    Older databases carry a ``streets`` table without the ``norm_name`` column
-    (and no ``street_groups`` table). Since the join output is fully derived from
-    the ``ways``/``meta`` extract data, the safest upgrade is to drop the stale
-    ``streets`` and ``street_groups`` tables and clear the ``done`` markers so a
-    fresh ``join`` rebuilds them under the current schema. Extract-side data
-    (``ways``, ``meta``) is left untouched, so no re-extraction is needed.
-    """
-    has_streets = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='streets'"
-    ).fetchone()
-    if has_streets is None:
-        return
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(streets)")}
-    if "norm_name" in columns:
-        return
-    with conn:
-        conn.execute("DROP TABLE IF EXISTS streets")
-        conn.execute("DROP TABLE IF EXISTS street_groups")
-        conn.execute("DELETE FROM done")
-
-
 def init_schema(conn: sqlite3.Connection) -> None:
     """Create all tables and indexes if they do not already exist.
 
     Idempotent: safe to call on both fresh and existing databases because every
-    statement uses ``CREATE ... IF NOT EXISTS``. A pre-``norm_name`` ``streets``
-    table is migrated first (see :func:`_migrate_streets`) so its absence of the
-    ``norm_name`` column does not break the new indexes and aggregation table.
+    statement uses ``CREATE ... IF NOT EXISTS``. The ``ways`` geometry columns
+    (``node_ids``, ``coords``) hold packed binary BLOBs, a format not compatible
+    with databases written by older versions that stored plain JSON text or
+    zlib-compressed JSON; such databases must be re-created (re-run ``extract``)
+    rather than migrated in place.
     """
-    _migrate_streets(conn)
     with conn:
         for statement in _SCHEMA_STATEMENTS:
             conn.execute(statement)
@@ -143,30 +123,134 @@ def connect(path: Path) -> sqlite3.Connection:
 # --- Serialization helpers --------------------------------------------------
 
 
-def serialize_node_ids(node_ids: list[int]) -> str:
-    """Serialize an ordered list of node ids to JSON text."""
-    return json.dumps(node_ids)
+# --- Serialization: zlib-JSON codec (retained alternative) ------------------
+#
+# An alternative to the binary codec the pipeline uses (defined below), kept side
+# by side so the two can be compared on speed and on-disk size.
+#
+# A way's geometry columns (``node_ids`` and ``coords``) are the two largest
+# consumers of disk space in a full database, and their JSON text is highly
+# redundant: repeated brackets/commas, node ids duplicated across both columns,
+# and lon/lat values within one way sharing long leading digits. Each column is
+# therefore stored as a zlib-compressed BLOB wrapping a JSON payload, which
+# shrinks the on-disk size while staying lossless — the decompressed bytes are
+# byte-identical to the plain-JSON form, so ``NodeRef`` round-trips exactly.
+# Per-row compression keeps streaming and resume independent across rows.
+_COMPRESS_LEVEL = 3
 
 
-def deserialize_node_ids(text: str) -> list[int]:
-    """Deserialize JSON text back into an ordered list of node ids."""
-    return [int(node_id) for node_id in json.loads(text)]
+def serialize_node_ids(node_ids: list[int]) -> bytes:
+    """Serialize an ordered list of node ids to a zlib-compressed JSON BLOB."""
+    return zlib.compress(json.dumps(node_ids).encode("utf-8"), _COMPRESS_LEVEL)
 
 
-def serialize_coords(coords: list[NodeRef]) -> str:
-    """Serialize resolved coordinates to JSON text.
+def deserialize_node_ids(blob: bytes) -> list[int]:
+    """Deserialize a zlib-compressed JSON BLOB back into an ordered node id list."""
+    return [int(node_id) for node_id in json.loads(zlib.decompress(blob))]
+
+
+def serialize_coords(coords: list[NodeRef]) -> bytes:
+    """Serialize resolved coordinates to a zlib-compressed JSON BLOB.
 
     Each :class:`~strade.models.NodeRef` becomes a ``[node_id, lon, lat]`` triple
-    so the way's geometry stays ordered and co-located within its row.
+    so the way's geometry stays ordered and co-located within its row; the JSON
+    array of triples is then zlib-compressed to shrink the stored bytes.
     """
-    return json.dumps([[ref.node_id, ref.lon, ref.lat] for ref in coords])
+    payload = json.dumps([[ref.node_id, ref.lon, ref.lat] for ref in coords])
+    return zlib.compress(payload.encode("utf-8"), _COMPRESS_LEVEL)
 
 
-def deserialize_coords(text: str) -> list[NodeRef]:
-    """Deserialize JSON text back into a list of :class:`NodeRef`."""
+def deserialize_coords(blob: bytes) -> list[NodeRef]:
+    """Deserialize a zlib-compressed JSON BLOB back into a list of :class:`NodeRef`."""
     return [
         NodeRef(node_id=int(node_id), lon=float(lon), lat=float(lat))
-        for node_id, lon, lat in json.loads(text)
+        for node_id, lon, lat in json.loads(zlib.decompress(blob))
+    ]
+
+
+# --- Serialization: binary codec (used by the pipeline) ---------------------
+#
+# The codec the pipeline actually reads and writes: it packs each column directly
+# to bytes with no per-row compression pass, which is markedly faster to
+# serialize and deserialize than the zlib-JSON codec above, for a small increase
+# in on-disk size.
+#
+# ``node_ids`` are stored as delta + zigzag + varint bytes: OSM node ids within
+# one way tend to be numerically close, so encoding successive differences (and
+# zigzag-folding them so small negatives stay small) lets most ids fit in one or
+# two varint bytes. This is the same integer packing Protocol Buffers and the
+# OSM PBF format use, and it is lossless.
+#
+# ``coords`` are stored as packed ``<qdd`` records — node id (int64) plus lon/lat
+# (float64) per point. The node id is kept per point (not recovered from
+# ``node_ids``) because a way's ``coords`` list is not positionally aligned with
+# its ``node_ids``: a node whose location is missing is dropped from ``coords``
+# but retained in ``node_ids``, so a mid-way gap would misalign a lon/lat-only
+# encoding. ``float64`` round-trips the exact WGS84 doubles, so it is lossless.
+
+
+def serialize_node_ids_binary(node_ids: list[int]) -> bytes:
+    """Serialize node ids as delta + zigzag + varint bytes (lossless)."""
+    out = bytearray()
+    prev = 0
+    for node_id in node_ids:
+        delta = node_id - prev
+        prev = node_id
+        # Zigzag: map signed delta to unsigned so small magnitudes stay short.
+        zigzag = (delta << 1) ^ (delta >> 63)
+        while True:
+            byte = zigzag & 0x7F
+            zigzag >>= 7
+            if zigzag:
+                out.append(byte | 0x80)
+            else:
+                out.append(byte)
+                break
+    return bytes(out)
+
+
+def deserialize_node_ids_binary(blob: bytes) -> list[int]:
+    """Deserialize delta + zigzag + varint bytes back into ordered node ids."""
+    node_ids: list[int] = []
+    prev = 0
+    zigzag = 0
+    shift = 0
+    for byte in blob:
+        zigzag |= (byte & 0x7F) << shift
+        if byte & 0x80:
+            shift += 7
+            continue
+        # Reverse zigzag, then undo the delta to recover the absolute id.
+        delta = (zigzag >> 1) ^ -(zigzag & 1)
+        prev += delta
+        node_ids.append(prev)
+        zigzag = 0
+        shift = 0
+    return node_ids
+
+
+# Per-point coord record: node id as signed int64, lon/lat as float64.
+_COORD_RECORD = struct.Struct("<qdd")
+
+
+def serialize_coords_binary(coords: list[NodeRef]) -> bytes:
+    """Serialize resolved coordinates as packed ``<qdd`` (node_id, lon, lat) records.
+
+    Each point is self-contained — its own node id is stored — because a way's
+    ``coords`` list is *not* positionally aligned with its ``node_ids``: a node
+    with a missing location is dropped from ``coords`` but kept in ``node_ids``,
+    so a mid-way gap would misalign a lon/lat-only encoding. Storing the id per
+    point keeps this codec correct on its own. ``float64`` is lossless.
+    """
+    pack = _COORD_RECORD.pack
+    return b"".join(pack(ref.node_id, ref.lon, ref.lat) for ref in coords)
+
+
+def deserialize_coords_binary(blob: bytes) -> list[NodeRef]:
+    """Deserialize packed ``<qdd`` records back into a list of :class:`NodeRef`."""
+    return [
+        NodeRef(node_id=node_id, lon=lon, lat=lat)
+        for node_id, lon, lat in _COORD_RECORD.iter_unpack(blob)
     ]
 
 
@@ -221,9 +305,10 @@ class WayWriter:
             raise ValueError("batch_size must be at least 1")
         self._conn = conn
         self._batch_size = batch_size
-        # Buffered (way_id, name, norm_name, node_ids_json, coords_json) rows
-        # awaiting flush.
-        self._pending: list[tuple[int, str, str, str, str]] = []
+        # Buffered (way_id, name, norm_name, node_ids_blob, coords_blob) rows
+        # awaiting flush; the last two are packed binary BLOBs (see the binary
+        # serialization section).
+        self._pending: list[tuple[int, str, str, bytes, bytes]] = []
 
     def __enter__(self) -> Self:
         return self
@@ -250,8 +335,8 @@ class WayWriter:
                 way.way_id,
                 way.name,
                 normalize_name(way.name),
-                serialize_node_ids(way.node_ids),
-                serialize_coords(way.coords),
+                serialize_node_ids_binary(way.node_ids),
+                serialize_coords_binary(way.coords),
             )
         )
         if len(self._pending) >= self._batch_size:
@@ -457,7 +542,7 @@ def read_groups(db: Path) -> Iterator[NameGroup]:
         current_key: str | None = None
         ways: list[HighwayWay] = []
         names: list[str] = []
-        for way_id, name, norm_name, node_ids_json, coords_json in cursor:
+        for way_id, name, norm_name, node_ids_blob, coords_blob in cursor:
             if current_key is not None and norm_name != current_key:
                 yield NameGroup(
                     name=_representative_name(names), key=current_key, ways=ways
@@ -470,8 +555,8 @@ def read_groups(db: Path) -> Iterator[NameGroup]:
                 HighwayWay(
                     way_id=int(way_id),
                     name=name,
-                    node_ids=deserialize_node_ids(node_ids_json),
-                    coords=deserialize_coords(coords_json),
+                    node_ids=deserialize_node_ids_binary(node_ids_blob),
+                    coords=deserialize_coords_binary(coords_blob),
                 )
             )
         if current_key is not None:
