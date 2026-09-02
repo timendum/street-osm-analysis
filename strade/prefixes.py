@@ -56,5 +56,5 @@ def format_counts(counts: Counter[str]) -> str:
     Ties on count are broken alphabetically by word so the output is stable
     across runs. Returns the empty string when there are no candidates.
     """
-    ordered = counts.most_common(20)
+    ordered = counts.most_common(50)
     return "\n".join(f"{count}\t{word}" for word, count in ordered)
