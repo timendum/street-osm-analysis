@@ -152,9 +152,10 @@ class ApplyAliasesTest(unittest.TestCase):
 
     def test_relabels_matching_rows_to_canonical_key(self) -> None:
         mapping = {"carlomarx": "karlmarx", "marx": "karlmarx", "kmarx": "karlmarx"}
-        count = store.apply_aliases(self.conn, mapping)
+        counts = store.apply_aliases(self.conn, mapping)
 
-        self.assertEqual(count, 3)
+        self.assertEqual(counts, {"carlomarx": 1, "marx": 1, "kmarx": 1})
+        self.assertEqual(sum(counts.values()), 3)
         norms = self._norm_names()
         self.assertEqual(norms[1], "karlmarx")
         self.assertEqual(norms[2], "karlmarx")
@@ -165,8 +166,8 @@ class ApplyAliasesTest(unittest.TestCase):
         self.assertEqual(self._norm_names()[4], "roma")
 
     def test_unknown_variant_relabels_nothing(self) -> None:
-        count = store.apply_aliases(self.conn, {"ghost": "karlmarx"})
-        self.assertEqual(count, 0)
+        counts = store.apply_aliases(self.conn, {"ghost": "karlmarx"})
+        self.assertEqual(counts, {"ghost": 0})
         # No row now carries the canonical key, since no variant matched.
         self.assertNotIn("karlmarx", set(self._norm_names().values()))
 

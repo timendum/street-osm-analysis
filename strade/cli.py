@@ -805,9 +805,10 @@ def run_alias(options: AliasOptions, reporter: Reporter) -> int:
     variant key the file lists that matches no street, since a shared alias file
     may name streets absent from the region being processed. It then relabels the
     matching streets to their canonical key via
-    :func:`~strade.store.apply_aliases`, rebuilds the ``street_groups``
-    aggregation with :func:`~strade.store.build_street_groups`, and prints the
-    refreshed top groups to standard output. A progress line reporting how many
+    :func:`~strade.store.apply_aliases` and rebuilds the ``street_groups``
+    aggregation with :func:`~strade.store.build_street_groups`. It prints one
+    ``<count> - <old name>`` line per mapping to standard output followed by the
+    total number of relabeled street rows. A progress line reporting how many
     street rows were relabeled goes to stderr. The run terminates with ``0`` when
     no non-fatal warnings were recorded, else a non-zero code.
     """
@@ -832,13 +833,15 @@ def run_alias(options: AliasOptions, reporter: Reporter) -> int:
                 f"{len(missing)} alias variant key(s) matched no street and were "
                 f"skipped: {', '.join(sorted(missing))}"
             )
-        relabeled = store.apply_aliases(conn, mapping)
+        counts = store.apply_aliases(conn, mapping)
         store.build_street_groups(conn)
-        top_groups = store.read_top_street_groups(conn, TOP_STREET_GROUPS)
     finally:
         conn.close()
 
-    print_top_street_groups(top_groups, sys.stdout)
+    relabeled = sum(counts.values())
+    for old, count in counts.items():
+        print(f"{count} - {old}", file=sys.stdout)
+    print(f"total: {relabeled}", file=sys.stdout)
 
     reporter.progress(
         f"alias: {relabeled} street(s) relabeled across {len(mapping)} mapping(s)"

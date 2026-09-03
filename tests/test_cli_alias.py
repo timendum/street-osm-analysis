@@ -79,8 +79,12 @@ class RunAliasTest(unittest.TestCase):
             self._street_norms(), ["karlmarx", "karlmarx", "karlmarx", "roma"]
         )
         self.assertEqual(self._group_keys(), {"karlmarx", "roma"})
-        # The refreshed top-groups summary is printed to stdout.
-        self.assertIn("karlmarx", out.getvalue())
+        # One "<count> - <old name>" line per mapping, plus the total.
+        printed = out.getvalue()
+        self.assertIn("1 - carlomarx", printed)
+        self.assertIn("1 - marx", printed)
+        self.assertIn("1 - kmarx", printed)
+        self.assertIn("total: 3", printed)
 
     def test_unknown_variant_warns_but_succeeds(self) -> None:
         self.alias_path.write_text("marx=karlmarx\nghost=karlmarx\n", encoding="utf-8")

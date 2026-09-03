@@ -476,16 +476,16 @@ def read_street_norm_names(conn: sqlite3.Connection) -> set[str]:
     return {row[0] for row in rows}
 
 
-def apply_aliases(conn: sqlite3.Connection, mapping: dict[str, str]) -> int:
+def apply_aliases(conn: sqlite3.Connection, mapping: dict[str, str]) -> dict[str, int]:
     """Relabel ``streets.norm_name`` from each variant key to its canonical key.
 
     Runs one ``UPDATE streets SET norm_name = new WHERE norm_name = old`` per
     entry of ``mapping`` inside a single ``with conn:`` transaction, so either
     every relabel commits or none does. Only the ``norm_name`` column is touched;
     a street's ``name`` and ``way_ids`` are left unchanged, so this is a pure
-    regrouping — no street rows are merged or moved. Returns the total number of
-    ``streets`` rows relabeled (summed across all entries), which the caller can
-    report; a variant key matching no row simply contributes zero.
+    regrouping — no street rows are merged or moved. Returns a mapping from each
+    variant key to the number of ``streets`` rows relabeled for it, which the
+    caller can report; a variant key matching no row maps to zero.
 
     The caller is expected to have validated ``mapping``, so no canonical key is itself
     a variant; this function therefore applies the entries in one pass without
@@ -493,15 +493,15 @@ def apply_aliases(conn: sqlite3.Connection, mapping: dict[str, str]) -> int:
     new keys is left to the caller (:func:`build_street_groups`) so the relabel
     transaction stays self-contained.
     """
-    relabeled = 0
+    counts: dict[str, int] = {}
     with conn:
         for old, new in mapping.items():
             cursor = conn.execute(
                 "UPDATE streets SET norm_name = ? WHERE norm_name = ?",
                 (new, old),
             )
-            relabeled += cursor.rowcount
-    return relabeled
+            counts[old] = cursor.rowcount
+    return counts
 
 
 def build_street_groups(conn: sqlite3.Connection) -> None:
