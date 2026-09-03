@@ -14,6 +14,9 @@ join *ARGS:
 map *ARGS:
   uv run strade map "$@"
 
+alias *ARGS:
+  uv run strade alias "$@"
+
 top DB LIMIT="20":
   sqlite3 -box "{{DB}}" "SELECT count, norm_name, name FROM street_groups ORDER BY count DESC, norm_name ASC LIMIT {{LIMIT}};"
 

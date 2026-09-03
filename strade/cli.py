@@ -18,6 +18,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from strade import store
+from strade.aliases import AliasError, check_consistency, parse_alias_file, unknown_keys
 from strade.collector import collect
 from strade.geometry import Projector
 from strade.joiner import (
@@ -146,6 +147,34 @@ class MapOptions:
     cell_km: float  # grid cell edge length in kilometers
     min_streets: int  # minimum streets for a cell to be plotted
     verbosity: int  # reporter verbosity level (incremented per -v)
+
+
+@dataclass(frozen=True)
+class AliasOptions:
+    """Resolved options for the ``alias`` command.
+
+    Reads a hand-curated alias file and folds its variant ``norm_name`` keys into
+    their canonical keys in the ``streets`` table of a database that ``join`` has
+    already populated, then rebuilds ``street_groups`` and prints the refreshed
+    top groups. ``alias_path`` defaults to ``aliases.txt`` in the database's
+    directory (the aliases are region-independent, so the name carries no
+    database stem); ``-a/--aliases`` overrides it.
+    """
+
+    database_path: Path  # SQLite checkpoint produced by `extract` + `join`
+    alias_path: Path  # alias file mapping variant keys to canonical keys
+    verbosity: int  # reporter verbosity level (incremented per -v)
+
+
+def default_alias_path(database_path: Path) -> Path:
+    """Derive the default ``alias`` file path from the database path.
+
+    Returns ``aliases.txt`` in the database's directory. The name deliberately
+    omits the database stem because the alias list is region-independent: the
+    same spelling fixes (``marx`` -> ``karlmarx`` …) apply to every dump, so one
+    ``aliases.txt`` beside the databases is reused across regions.
+    """
+    return database_path.with_name("aliases.txt")
 
 
 def default_map_output_path(database_path: Path, target: str) -> Path:
@@ -352,21 +381,56 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # alias: fold variant norm_name keys into canonical keys in a joined database.
+    alias = subparsers.add_parser(
+        "alias",
+        parents=[common],
+        help=(
+            "Merge hand-listed street-name variants: relabel their norm_name in "
+            "the streets table to a canonical key, then rebuild street_groups."
+        ),
+    )
+    alias.add_argument(
+        "database",
+        type=Path,
+        help="Path to the SQLite checkpoint produced by `extract` and `join`.",
+    )
+    alias.add_argument(
+        "-a",
+        "--aliases",
+        dest="aliases",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the alias file (old=new per line). Defaults to aliases.txt "
+            "in the database's directory."
+        ),
+    )
+
     return parser
 
 
 def parse_args(
     argv: list[str],
-) -> ExtractOptions | JoinOptions | ThresholdOptions | PrefixesOptions | MapOptions:
+) -> (
+    ExtractOptions
+    | JoinOptions
+    | ThresholdOptions
+    | PrefixesOptions
+    | MapOptions
+    | AliasOptions
+):
     """Parse command-line arguments into resolved options.
 
     Dispatches on the subcommand and returns :class:`ExtractOptions` for
-    ``extract``, :class:`JoinOptions` for ``join``, or :class:`PrefixesOptions`
-    for ``prefixes``. For ``extract``, the
+    ``extract``, :class:`JoinOptions` for ``join``, :class:`PrefixesOptions`
+    for ``prefixes``, :class:`MapOptions` for ``map``, or :class:`AliasOptions`
+    for ``alias``. For ``extract``, the
     database path defaults to :func:`default_database_path` when omitted; an
     explicit ``-d/--database`` value takes precedence over the optional
     positional, which in turn overrides the derived default. For ``join``, the
-    proximity threshold defaults to 25 meters.
+    proximity threshold defaults to 25 meters. For ``alias``, the alias file
+    defaults to :func:`default_alias_path` when ``-a/--aliases`` is omitted.
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -394,6 +458,14 @@ def parse_args(
             output_path=output,
             cell_km=args.cell,
             min_streets=args.min_streets,
+            verbosity=args.verbosity,
+        )
+
+    if args.command == "alias":
+        alias_path = args.aliases or default_alias_path(args.database)
+        return AliasOptions(
+            database_path=args.database,
+            alias_path=alias_path,
             verbosity=args.verbosity,
         )
 
@@ -719,14 +791,71 @@ def run_map(options: MapOptions, reporter: Reporter) -> int:
     return reporter.exit_code
 
 
+def run_alias(options: AliasOptions, reporter: Reporter) -> int:
+    """Run the ``alias`` command; returns the process exit code.
+
+    Parses the alias file (``old=new`` per line) into a variant->canonical
+    mapping and validates its consistency *before* opening the database, so a
+    malformed or inconsistent file (a canonical key that is itself a variant)
+    halts the command with a warning and a non-zero exit code without touching
+    any data — mirroring how :func:`run_extract` treats a fatal input error.
+
+    With a valid mapping, it opens the database, reads the ``norm_name`` keys
+    actually present in the ``streets`` table, and warns (non-fatally) for any
+    variant key the file lists that matches no street, since a shared alias file
+    may name streets absent from the region being processed. It then relabels the
+    matching streets to their canonical key via
+    :func:`~strade.store.apply_aliases`, rebuilds the ``street_groups``
+    aggregation with :func:`~strade.store.build_street_groups`, and prints the
+    refreshed top groups to standard output. A progress line reporting how many
+    street rows were relabeled goes to stderr. The run terminates with ``0`` when
+    no non-fatal warnings were recorded, else a non-zero code.
+    """
+    try:
+        mapping = parse_alias_file(options.alias_path)
+        check_consistency(mapping)
+    except AliasError as exc:
+        # Fatal alias-file error: report it and terminate non-zero before any
+        # database work, so nothing is overwritten from an ambiguous file.
+        reporter.warn(str(exc))
+        return reporter.exit_code or 1
+    except OSError as exc:
+        reporter.warn(f"could not read alias file {options.alias_path}: {exc}")
+        return reporter.exit_code or 1
+
+    conn = store.connect(options.database_path)
+    try:
+        existing = store.read_street_norm_names(conn)
+        missing = unknown_keys(mapping, existing)
+        if missing:
+            reporter.warn(
+                f"{len(missing)} alias variant key(s) matched no street and were "
+                f"skipped: {', '.join(sorted(missing))}"
+            )
+        relabeled = store.apply_aliases(conn, mapping)
+        store.build_street_groups(conn)
+        top_groups = store.read_top_street_groups(conn, TOP_STREET_GROUPS)
+    finally:
+        conn.close()
+
+    print_top_street_groups(top_groups, sys.stdout)
+
+    reporter.progress(
+        f"alias: {relabeled} street(s) relabeled across {len(mapping)} mapping(s)"
+    )
+    # 0 when no non-fatal warnings were recorded, else non-zero.
+    return reporter.exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     """Console entry point: parse args and dispatch to the matching command.
 
     Parses ``argv`` (defaulting to ``sys.argv[1:]``) into resolved options,
     constructs a :class:`~strade.reporter.Reporter`, and dispatches to
     :func:`run_extract` for :class:`ExtractOptions`, :func:`run_join` for
-    :class:`JoinOptions`, :func:`run_threshold` for :class:`ThresholdOptions`, or
-    :func:`run_prefixes` for :class:`PrefixesOptions`.
+    :class:`JoinOptions`, :func:`run_threshold` for :class:`ThresholdOptions`,
+    :func:`run_prefixes` for :class:`PrefixesOptions`, :func:`run_map` for
+    :class:`MapOptions`, or :func:`run_alias` for :class:`AliasOptions`.
     Returns the command's process exit code.
     """
     try:
@@ -740,6 +869,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_threshold(options, reporter)
         if isinstance(options, MapOptions):
             return run_map(options, reporter)
+        if isinstance(options, AliasOptions):
+            return run_alias(options, reporter)
         return run_join(options, reporter)
     except KeyboardInterrupt:
         # Ctrl-C

@@ -13,7 +13,7 @@ so a long run is resumable after an interruption:
    streets.
 
 A helper **`prefixes`** command scans a dump for candidate street-type words to
-extend the normalizer's prefix list. A helper **`threshold`** command reports "almost joined" way pairs whose distance is between the current threshold and its double, with the distance, to help tune `-t`. A helper **`map`** command plots where a target `norm_name` is proportionally most common: it bins the joined streets into a square metric grid and colours each cell by the share of its streets carrying that key, so the result is normalized against street density rather than being a plain density/population map.
+extend the normalizer's prefix list. A helper **`threshold`** command reports "almost joined" way pairs whose distance is between the current threshold and its double, with the distance, to help tune `-t`. A helper **`map`** command plots where a target `norm_name` is proportionally most common: it bins the joined streets into a square metric grid and colours each cell by the share of its streets carrying that key, so the result is normalized against street density rather than being a plain density/population map. A helper **`alias`** command runs after `join` to merge street-name variants the normalizer cannot catch (bad OSM data such as `carlomarx`, `karlmarx`, `marx`): it reads a hand-curated `old=new` file, rewrites each variant `norm_name` in the `streets` table to its canonical key, and rebuilds `street_groups`. The file defaults to `aliases.txt` beside the database (`-a` overrides) and is region-independent; an inconsistent file (a canonical key also listed as a variant) halts the command before any write.
 
 ### Technical decisions
 
@@ -39,8 +39,10 @@ If a edit change something written here, ask the user if he wants to update AGEN
   `StreetWriter` (persists a group's streets and its done-marker in one
   transaction), `DoneSet`, header/count metadata, `read_groups` (streams
   ways ordered by normalization key, yielding one `NameGroup` per contiguous
-  run), and `read_street_points` / `count_streets` (streams joined streets as
-  representative points for the `map` command).
+  run), `read_street_points` / `count_streets` (streams joined streets as
+  representative points for the `map` command), and `apply_aliases` /
+  `read_street_norm_names` (relabels `streets.norm_name` for the `alias` command
+  in one transaction).
 - `normalize.py` — derives the language/type-agnostic grouping key: strips
   street-type prefixes (Italian + French) and folds to lowercase ASCII
   letters/digits, so bilingual and prefix variants collapse to one key.
@@ -57,6 +59,10 @@ If a edit change something written here, ask the user if he wants to update AGEN
 - `writer.py` — prints the top street-group summary.
 - `models.py` — core dataclasses: `NodeRef`, `HighwayWay`, `NameGroup`, `Street`.
 - `prefixes.py` — first-word scan for discovering unhandled street-type prefixes.
+- `aliases.py` — parses and validates the `alias` command's `old=new` file into a
+  variant→canonical mapping (`parse_alias_file`), rejecting malformed, duplicate,
+  or inconsistent mappings (`AliasError`, `check_consistency`) and reporting
+  variant keys absent from the data (`unknown_keys`).
 - `reporter.py` — non-fatal warning/progress sink and exit-code aggregation.
 - `validation.py` — input-path/format validation (`InputError`, `SupportedFormat`).
 
@@ -70,6 +76,10 @@ If a edit change something written here, ask the user if he wants to update AGEN
 - **Key vs. display name**: the normalization key groups streets and is the
   stable resume marker; a representative raw name is chosen for display so the
   lossy key never reaches the output.
+- **Aliasing is a post-join relabel**: `alias` only rewrites `norm_name` on
+  already-joined `streets` rows (never moving way ids or merging rows) and is not
+  wired into `join`, so re-running `join` discards it and the `alias` command
+  must be re-run.
 
 ### Dependencies
 
