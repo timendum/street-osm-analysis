@@ -725,6 +725,64 @@ def read_display_name(db: Path, norm_name: str) -> str | None:
         conn.close()
 
 
+@dataclass(frozen=True)
+class MatchedWay:
+    """A named way that matched a ``cities`` LIKE pattern, reduced to one point.
+
+    Carries the raw ``name`` (for reporting/debugging) and a single
+    representative ``(lon, lat)`` used for the point-in-polygon test that decides
+    which city the way falls in. The point is the way's first resolved vertex —
+    a cheap, stable choice: a way lying inside a comune has all of its vertices
+    inside it, and the point-in-polygon design already accepts that a way
+    straddling a border is attributed by a single representative point.
+    """
+
+    name: str
+    lon: float
+    lat: float
+
+
+def read_ways_matching(db: Path, patterns: list[str]) -> Iterator[MatchedWay]:
+    """Stream one :class:`MatchedWay` per way whose ``name`` matches a pattern.
+
+    Builds a single ``WHERE name LIKE ? OR name LIKE ? ...`` query from
+    ``patterns`` (used verbatim as SQLite ``LIKE`` patterns, so ``%``/``_``
+    wildcards apply and matching is ASCII-case-insensitive) and streams the
+    matching rows, decoding each way's packed ``coords`` to recover its first
+    resolved vertex as the representative point. A matched way with no resolved
+    coordinates is skipped, since it cannot be placed inside any city.
+
+    The string matching runs entirely in SQLite, so only the (typically few)
+    ways that already matched a pattern are decoded and handed back for the more
+    expensive containment test. ``patterns`` must be non-empty; an empty list
+    would build an invalid query, and the ``cities`` command rejects an empty
+    pattern file before calling this.
+
+    Opens and closes its own connection over the iterator's lifetime, so callers
+    should drive it to completion (or close it) to release the database handle.
+    """
+    if not patterns:
+        raise ValueError("read_ways_matching requires at least one LIKE pattern")
+
+    where = " OR ".join("name LIKE ?" for _ in patterns)
+    conn = connect(db)
+    try:
+        cursor = conn.execute(
+            # `where` is built only from the fixed "name LIKE ?" template, one
+            # per pattern; the patterns themselves are bound parameters below.
+            f"SELECT name, coords FROM ways WHERE {where}",
+            patterns,
+        )
+        for name, coords_blob in cursor:
+            coords = deserialize_coords_binary(coords_blob)
+            if not coords:
+                continue
+            first = coords[0]
+            yield MatchedWay(name=name, lon=first.lon, lat=first.lat)
+    finally:
+        conn.close()
+
+
 class DoneSet:
     """The set of street names already fully written, backed by the ``done`` table.
 

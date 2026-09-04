@@ -7,11 +7,18 @@ These dataclasses describe the records that flow through the pipeline:
 - ``NameGroup`` — all highway ways that share one exact street name.
 - ``Street``     — a distinct produced street: display name, norm_name key, and
   sorted, de-duplicated way ids.
+- ``CityArea``   — an OSM ``admin_level=8`` boundary with its identifying tags
+  and assembled polygon, used by the ``cities`` command.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from shapely import Polygon
+    from shapely.geometry.base import BaseGeometry
 
 
 @dataclass(frozen=True)
@@ -87,3 +94,26 @@ class Street:
     def count(self) -> int:
         """Number of distinct composing way ids in this street."""
         return len(self.way_ids)
+
+
+@dataclass(frozen=True)
+class CityArea:
+    """An OSM ``admin_level=8`` administrative boundary (an Italian ``comune``).
+
+    Carries the identifying tags the ``cities`` command reports plus the
+    assembled boundary ``geometry`` (a shapely ``Polygon``/``MultiPolygon`` in
+    raw WGS84 lon/lat) used for point-in-polygon containment tests. Every tag
+    except ``name`` may be absent in the dump and is then ``None``; ``name`` is
+    also ``None`` for the (rare) boundary without a ``name`` tag.
+
+    Frozen because a parsed boundary never changes; the geometry is built once
+    from the area's rings while the OSM object is still live and then reused for
+    every containment test.
+    """
+
+    name: str | None
+    postal_code: str | None
+    istat: str | None
+    catasto: str | None
+    wikidata: str | None
+    geometry: BaseGeometry | Polygon

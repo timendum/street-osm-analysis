@@ -1,11 +1,11 @@
 """Command-line interface for the Italian Street Extractor.
 
-Exposes the ``extract``, ``join``, ``threshold``, ``prefixes``, and ``map``
-subcommands, each with its own options. This module owns argument parsing
-(:func:`parse_args`), the derivation of default output paths
-(:func:`default_database_path`, :func:`default_map_output_path`), and the
+Exposes the ``extract``, ``join``, ``threshold``, ``prefixes``, ``map``,
+``alias``, and ``cities`` subcommands, each with its own options. This module
+owns argument parsing (:func:`parse_args`), the derivation of default output
+paths (:func:`default_database_path`, :func:`default_map_output_path`), and the
 per-command orchestration (``run_extract`` / ``run_join`` / ``run_threshold`` /
-``run_prefixes`` / ``run_map``).
+``run_prefixes`` / ``run_map`` / ``run_alias`` / ``run_cities``).
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from tqdm import tqdm
 
 from strade import store
 from strade.aliases import AliasError, check_consistency, parse_alias_file, unknown_keys
+from strade.cities import assign_matches, build_city_index, write_csv
 from strade.collector import collect
 from strade.geometry import Projector
 from strade.joiner import (
@@ -28,7 +29,8 @@ from strade.joiner import (
     print_candidate_pairs,
 )
 from strade.mapper import build_grid, render_map
-from strade.parser import parse_highways
+from strade.parser import parse_admin_areas, parse_highways
+from strade.patterns import PatternError, parse_pattern_file
 from strade.prefixes import format_counts, scan_first_words
 from strade.reporter import Reporter
 from strade.store import StreetWriter
@@ -163,6 +165,25 @@ class AliasOptions:
 
     database_path: Path  # SQLite checkpoint produced by `extract` + `join`
     alias_path: Path  # alias file mapping variant keys to canonical keys
+    verbosity: int  # reporter verbosity level (incremented per -v)
+
+
+@dataclass(frozen=True)
+class CitiesOptions:
+    """Resolved options for the ``cities`` command.
+
+    Reads ``admin_level=8`` comune boundaries from the OSM dump and the named
+    ways from the ``extract`` database, then reports (as CSV on stdout) for each
+    comune whether it contains at least one street whose name matches a
+    ``LIKE`` pattern from ``pattern_path``. ``database_path`` defaults to the
+    dump path with a ``.db`` extension (like ``extract``) when the optional
+    ``database`` positional is omitted; the pattern file has no default and must
+    be supplied.
+    """
+
+    input_path: Path  # OSM dump, read for comune boundaries
+    database_path: Path  # SQLite checkpoint produced by `extract`, read for ways
+    pattern_path: Path  # file of SQLite LIKE patterns, one per line
     verbosity: int  # reporter verbosity level (incremented per -v)
 
 
@@ -407,6 +428,39 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # cities: report, per admin_level=8 comune, whether a matching street exists.
+    cities = subparsers.add_parser(
+        "cities",
+        parents=[common],
+        help=(
+            "For every admin_level=8 comune boundary in the dump, report as CSV "
+            "whether it contains at least one street whose name matches a LIKE "
+            "pattern from the pattern file."
+        ),
+    )
+    cities.add_argument(
+        "input",
+        type=Path,
+        help="Path to the OSM dump to read comune boundaries from (.osm.pbf, ...).",
+    )
+    cities.add_argument(
+        "patterns",
+        type=Path,
+        help="Path to a file of SQLite LIKE patterns, one per line (# comments allowed).",
+    )
+    # Optional and last so the two-argument form (dump + patterns) resolves the
+    # database from the dump path without ambiguity.
+    cities.add_argument(
+        "database",
+        type=Path,
+        nargs="?",
+        default=None,
+        help=(
+            "Path to the SQLite checkpoint produced by `extract` (read for the "
+            "ways). Defaults to the dump path with a .db extension."
+        ),
+    )
+
     return parser
 
 
@@ -419,6 +473,7 @@ def parse_args(
     | PrefixesOptions
     | MapOptions
     | AliasOptions
+    | CitiesOptions
 ):
     """Parse command-line arguments into resolved options.
 
@@ -466,6 +521,19 @@ def parse_args(
         return AliasOptions(
             database_path=args.database,
             alias_path=alias_path,
+            verbosity=args.verbosity,
+        )
+
+    if args.command == "cities":
+        # The optional database positional overrides the default derived from the
+        # dump path (as in `extract`).
+        database = args.database
+        if database is None:
+            database = default_database_path(args.input)
+        return CitiesOptions(
+            input_path=args.input,
+            database_path=database,
+            pattern_path=args.patterns,
             verbosity=args.verbosity,
         )
 
@@ -850,6 +918,70 @@ def run_alias(options: AliasOptions, reporter: Reporter) -> int:
     return reporter.exit_code
 
 
+def run_cities(options: CitiesOptions, reporter: Reporter) -> int:
+    """Run the ``cities`` command; returns the process exit code.
+
+    Validates the OSM dump, then reads the LIKE-pattern file (a file with no
+    usable pattern is a fatal error). It streams the dump's ``admin_level=8``
+    comune boundaries into a :class:`~strade.cities.CityIndex` (a spatial index
+    for point-in-polygon lookup), then streams only the ways whose name matches a
+    pattern from the ``extract`` database
+    (:func:`~strade.store.read_ways_matching`) and flags the comune each matching
+    way falls in. Finally it writes one CSV row per comune to standard output —
+    the identifying tags plus a ``true``/``false`` ``matched`` column — keeping
+    all progress and warnings on stderr via the reporter.
+
+    A fatal input error (missing/unsupported dump, missing database, or an empty
+    pattern file) is reported via the reporter and mapped to a non-zero exit
+    code. On success the run terminates with ``0`` when no non-fatal warnings
+    were recorded, else a non-zero code.
+    """
+    try:
+        fmt = validate_input(options.input_path)
+    except InputError as exc:
+        # Fatal input error: report it and terminate non-zero.
+        reporter.warn(str(exc))
+        return reporter.exit_code or 1
+
+    if not options.database_path.is_file():
+        reporter.warn(
+            f"database not found: {options.database_path} (run `extract` first)"
+        )
+        return reporter.exit_code or 1
+
+    try:
+        patterns = parse_pattern_file(options.pattern_path)
+    except (PatternError, OSError) as exc:
+        reporter.warn(str(exc))
+        return reporter.exit_code or 1
+
+    reporter.progress(
+        f"cities: matching {len(patterns)} pattern(s) against streets in comuni"
+    )
+
+    # Pass 1: build the comune spatial index from the dump's boundaries.
+    index = build_city_index(
+        parse_admin_areas(options.input_path, fmt, reporter),
+        reporter,
+    )
+
+    # Pass 2: stream only the pattern-matched ways from the database and flag the
+    # comune each one falls in. The string match runs in SQLite, so the (usually
+    # small) matched subset is all that reaches the point-in-polygon test.
+    matched_ways = store.read_ways_matching(options.database_path, patterns)
+    consumed = assign_matches(index, matched_ways)
+
+    rows = write_csv(index.matches, sys.stdout)
+
+    hit = sum(1 for match in index.matches if match.matched)
+    reporter.progress(
+        f"cities: {hit} of {rows} comune(i) matched "
+        f"({consumed} matching street(s) placed)"
+    )
+    # 0 when no non-fatal warnings were recorded, else non-zero.
+    return reporter.exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     """Console entry point: parse args and dispatch to the matching command.
 
@@ -874,6 +1006,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_map(options, reporter)
         if isinstance(options, AliasOptions):
             return run_alias(options, reporter)
+        if isinstance(options, CitiesOptions):
+            return run_cities(options, reporter)
         return run_join(options, reporter)
     except KeyboardInterrupt:
         # Ctrl-C

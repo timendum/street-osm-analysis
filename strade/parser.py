@@ -26,10 +26,12 @@ from typing import TYPE_CHECKING
 
 import osmium
 import osmium.filter
+import osmium.geom
 import osmium.osm
+import shapely
 from tqdm import tqdm
 
-from strade.models import HighwayWay, NodeRef
+from strade.models import CityArea, HighwayWay, NodeRef
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -41,6 +43,12 @@ if TYPE_CHECKING:
 # A way needs at least two resolved nodes to form a line; fewer than this and it
 # cannot contribute a geometry, so it is dropped.
 _MIN_NODES = 2
+
+# The OSM tags that select an Italian comune boundary and the ones the `cities`
+# command reports for each. ``boundary=administrative`` + ``admin_level=8`` is
+# the comune level in Italy.
+_BOUNDARY_TAG = ("boundary", "administrative")
+_COMUNE_ADMIN_LEVEL = "8"
 
 
 def parse_highways(
@@ -150,3 +158,94 @@ def _resolve_nodes(way: osmium.osm.Way) -> tuple[list[int], list[NodeRef], int]:
         else:
             missing += 1
     return node_ids, coords, missing
+
+
+def parse_admin_areas(
+    path: Path,
+    fmt: SupportedFormat,
+    reporter: Reporter,
+) -> Iterator[CityArea]:
+    """Yield a :class:`CityArea` for every ``admin_level=8`` boundary in the dump.
+
+    Drives pyosmium's area builder over ``path``: a ``boundary=administrative``
+    tag filter admits candidate boundary relations, which libosmium assembles
+    into ready-made :class:`osmium.osm.Area` objects (their member ways and nodes
+    are read and stitched into rings automatically). Areas whose ``admin_level``
+    is not ``8`` — provinces, regions, and non-comune boundaries — are skipped,
+    so only Italian comuni reach the caller.
+
+    For each comune the boundary geometry is assembled into a shapely
+    ``MultiPolygon`` (in raw WGS84 lon/lat, since containment is a topological
+    test that needs no metric projection) and paired with the identifying tags
+    the ``cities`` command reports: ``name``, ``postal_code``, ``ref:ISTAT``,
+    ``ref:catasto`` and ``wikidata``. A missing tag becomes ``None``.
+
+    Args:
+        path: Filesystem path to the OSM dump.
+        fmt: The detected input format; accepted for interface symmetry with
+            :func:`parse_highways`. pyosmium infers the reader from the file
+            itself, so this argument is not otherwise consumed.
+        reporter: Sink for non-fatal warnings about boundaries whose geometry
+            could not be assembled.
+
+    Yields:
+        One :class:`CityArea` per ``admin_level=8`` boundary whose geometry was
+        assembled successfully. A boundary whose ring assembly fails is dropped
+        with a warning rather than aborting the whole scan.
+    """
+    del fmt  # pyosmium detects the reader from the file; kept for interface symmetry.
+
+    wkb_factory = osmium.geom.WKBFactory()
+
+    processor = osmium.FileProcessor(str(path)).with_areas(
+        osmium.filter.TagFilter(_BOUNDARY_TAG),
+    )
+
+    # The dump does not expose an area count without a prior pass, so the bar
+    # runs without a total: it reports throughput and a running count.
+    areas = tqdm(
+        processor,
+        desc="parsing boundaries",
+        unit="area",
+    )
+
+    for obj in areas:
+        # with_areas still streams non-area objects (the ways/nodes it read to
+        # build the areas); only assembled areas carry a boundary geometry.
+        if not obj.is_area():
+            continue
+
+        tags = obj.tags
+        if tags.get("admin_level") != _COMUNE_ADMIN_LEVEL:
+            # Not a comune (province/region/other administrative level).
+            continue
+
+        name = tags.get("name")
+        try:
+            # create_multipolygon returns a hex-encoded WKB string; shapely reads
+            # the raw bytes. The geometry must be built while ``obj`` is still the
+            # live area — libosmium invalidates it once iteration advances.
+            wkb_hex = wkb_factory.create_multipolygon(obj)
+            geometry = shapely.from_wkb(bytes.fromhex(wkb_hex))
+        except (RuntimeError, ValueError) as exc:
+            reporter.info(
+                f"boundary {name or obj.orig_id!r} could not be assembled into a "
+                f"polygon ({exc}); skipping it"
+            )
+            continue
+
+        if geometry.is_empty:
+            reporter.info(
+                f"boundary {name or obj.orig_id!r} assembled to an empty geometry; "
+                "skipping it"
+            )
+            continue
+
+        yield CityArea(
+            name=name,
+            postal_code=tags.get("postal_code"),
+            istat=tags.get("ref:ISTAT"),
+            catasto=tags.get("ref:catasto"),
+            wikidata=tags.get("wikidata"),
+            geometry=geometry,
+        )
