@@ -5,15 +5,52 @@ of named Italian streets. It targets bilingual regions (e.g. Valle d'Aosta),
 where one physical street appears under several surface forms, and collapses
 those variants together.
 
-The tool runs in two stages that hand off through a SQLite checkpoint database,
-so a long run is resumable after an interruption:
+### Description
 
-1. **`extract`** — stream-parse the dump and store named highway ways.
-2. **`join`** — group the stored ways by street and join fragments into distinct
-   streets.
+The core pipeline runs in two stages that hand off through a SQLite checkpoint
+database. The rest are helper commands.
 
-A helper **`prefixes`** command scans a dump for candidate street-type words to
-extend the normalizer's prefix list. A helper **`threshold`** command reports "almost joined" way pairs whose distance is between the current threshold and its double, with the distance, to help tune `-t`. A helper **`map`** command plots where a target `norm_name` is proportionally most common: it bins the joined streets into a square metric grid and colours each cell by the share of its streets carrying that key, so the result is normalized against street density rather than being a plain density/population map. A helper **`alias`** command runs after `join` to merge street-name variants the normalizer cannot catch (bad OSM data such as `carlomarx`, `karlmarx`, `marx`): it reads a hand-curated `old=new` file, rewrites each variant `norm_name` in the `streets` table to its canonical key, and rebuilds `street_groups`. The file defaults to `aliases.txt` beside the database (`-a` overrides) and is region-independent; an inconsistent file (a canonical key also listed as a variant) halts the command before any write. A helper **`cities`** command runs after `extract` to answer, for every `admin_level=8` comune, whether it contains at least one matching street: it reads the comune boundaries from the OSM dump (pass 1) and the named ways from the database (pass 2), matches way names against a file of SQLite `LIKE` patterns (one per line, `#` comments allowed), tests each matching way's representative point against the boundaries with a point-in-polygon lookup, and writes one CSV row per comune (`name,postal_code,istat,catasto,wikidata,matched`) to stdout. The database defaults to the dump path with a `.db` extension (or is passed as an optional positional argument).
+The database defaults to the dump path with a `.db` extension, or is passed as
+an optional positional argument.
+
+- **`extract`** — stream-parse the dump and store named highway ways. A second
+  pass also stores every named `place=square` element (node, closed way, or
+  multipolygon relation), each reduced to a single representative point, in a
+  separate `squares` table for the `cities` command.
+
+  > **Resumable**: tracks a way-id cursor so a long run survives an interruption.
+
+- **`join`** — group the stored ways by street and join fragments into distinct
+  streets.
+
+  > **Resumable**: tracks per-group done-markers so a long run survives an
+  > interruption.
+
+- **`prefixes`** (helper) — scans a dump for candidate street-type words to
+  extend the normalizer's prefix list.
+
+- **`threshold`** (helper) — reports "almost joined" way pairs whose distance is
+  between the current threshold and its double, with the distance, to help tune
+  `-t`.
+
+- **`map`** — plots where a target `norm_name` is proportionally most
+  common: it bins the joined streets into a square metric grid and colours each
+  cell by the share of its streets carrying that key, so the result is
+  normalized against street density rather than being a plain density/population
+  map.
+
+- **`alias`** (runs after `join`) — merges street-name variants the normalizer
+  cannot catch (bad OSM data such as `carlomarx`, `karlmarx`, `marx`) using a
+  hand-curated `old=new` file: it rewrites each variant `norm_name` in the
+  `streets` table to its canonical key and rebuilds `street_groups`. The file
+  defaults to `aliases.txt` beside the database (`-a` overrides).
+
+- **`cities`** (runs after `extract`) — flags, for every `admin_level=8`
+  comune, whether it contains at least one street or square whose name matches a
+  file of SQLite `LIKE` patterns, via a point-in-polygon test against the comune
+  boundaries read from the dump. Writes one CSV row per comune
+  to a `<database>-<pattern_file>.csv` file beside the database.  
+  An optional `-r/--region <osm_relation_id>` clips the report to a parent boundary (country `admin_level=2` / region `4`), dropping comuni that spill in from across the extract's cut; the hierarchy is hardcoded for Italy.
 
 ### Technical decisions
 
@@ -26,28 +63,25 @@ Use modern Python:
 
 If a edit change something written here, ask the user if he wants to update AGENTS.md.
 
-### Pipeline / module map (`strade/`)
+### Module map (`strade/`)
 
 - `cli.py` — argument parsing and the `run_xxx` orchestration;
   console entry point `main` (also reachable via `main.py`).
-- `parser.py` — streaming pyosmium reader; `parse_highways` yields `HighwayWay`
-  for each way with a `highway` tag, resolving node coordinates in one pass and
-  supporting resume via a way-id cursor. `parse_admin_areas` is a second reader
-  (`.with_areas`) that yields a `CityArea` for each `admin_level=8` boundary,
-  assembling its polygon (raw WGS84 lon/lat) with `WKBFactory` + shapely for the
-  `cities` command.
+- `parser.py` — streaming pyosmium readers:
+  - `parse_highways` yields a `HighwayWay` per `highway`-tagged way, resolving
+  node coordinates in one pass and supporting resume via a way-id cursor.
+  - `parse_admin_areas` yields a `CityArea` per administrative boundary at the
+  levels `cities` reads (comune `8` plus parent `2`/`4`).
+  - `parse_squares` yields a `Square` per named `place=square` element, reduced
+  to a representative point.
 - `collector.py` — routes named ways to storage and counts unnamed ones during
   the extract pass. Grouping is deliberately deferred to the join side.
-- `store.py` — SQLite schema, connection (WAL), serialization, `WayWriter`,
-  `StreetWriter` (persists a group's streets and its done-marker in one
-  transaction), `DoneSet`, header/count metadata, `read_groups` (streams
-  ways ordered by normalization key, yielding one `NameGroup` per contiguous
-  run), `read_street_points` / `count_streets` (streams joined streets as
-  representative points for the `map` command), `apply_aliases` /
-  `read_street_norm_names` (relabels `streets.norm_name` for the `alias` command
-  in one transaction), and `read_ways_matching` (streams a `MatchedWay` — name
-  plus one representative point — per way whose name matches a SQLite `LIKE`
-  pattern, for the `cities` command).
+- `store.py` — the SQLite checkpoint layer both stages hand off through: schema,
+  WAL connection, way/coord (de)serialization, and the writer/reader helpers for
+  ways, joined streets and squares. Owns the resume markers (extract's way-id
+  cursor via header/count metadata, join's per-group `DoneSet`) and the reads
+  the later commands query (`read_groups` in normalization-key order, street
+  points, alias relabeling, `*_matching` pattern lookups).
 - `normalize.py` — derives the language/type-agnostic grouping key: strips
   street-type prefixes (Italian + French) and folds to lowercase ASCII
   letters/digits, so bilingual and prefix variants collapse to one key.
@@ -63,20 +97,21 @@ If a edit change something written here, ask the user if he wants to update AGEN
   and `render_map` draws the coloured grid to an image with matplotlib.
 - `writer.py` — prints the top street-group summary.
 - `models.py` — core dataclasses: `NodeRef`, `HighwayWay`, `NameGroup`, `Street`,
-  and `CityArea` (an `admin_level=8` boundary's tags + assembled polygon).
+  `CityArea`, and `Square`.
 - `prefixes.py` — first-word scan for discovering unhandled street-type prefixes.
 - `aliases.py` — parses and validates the `alias` command's `old=new` file into a
-  variant→canonical mapping (`parse_alias_file`), rejecting malformed, duplicate,
-  or inconsistent mappings (`AliasError`, `check_consistency`) and reporting
-  variant keys absent from the data (`unknown_keys`).
+  variant→canonical mapping, rejecting malformed, duplicate, or inconsistent
+  mappings and reporting variant keys absent from the data.
 - `patterns.py` — parses the `cities` command's LIKE-pattern file into a list of
   patterns (`parse_pattern_file`), skipping blank/`#` lines and rejecting an
   empty file (`PatternError`).
-- `cities.py` — the `cities` command's pure aggregation: a `CityIndex` wraps an
-  STRtree over the comune boundaries for point-in-polygon lookup (`mark_point`
-  uses the `intersects` predicate, since `STRtree.query` reads
-  `query_geom.predicate(tree_geom)`), `assign_matches` flags each comune from the
-  matched ways, and `write_csv` renders one row per comune.
+- `cities.py` — the `cities` command's pure aggregation: splits the parsed
+  boundaries into comuni and parent (region/country) levels, optionally clipping
+  to the comuni inside a `-r` parent, then wraps an STRtree over the kept comune
+  boundaries for point-in-polygon lookup, flags each comune from the matched
+  way/square points, and renders one CSV row per comune. Point containment uses
+  the `intersects` predicate, since `STRtree.query` reads
+  `query_geom.predicate(tree_geom)`.
 - `reporter.py` — non-fatal warning/progress sink and exit-code aggregation.
 - `validation.py` — input-path/format validation (`InputError`, `SupportedFormat`).
 
@@ -94,13 +129,6 @@ If a edit change something written here, ask the user if he wants to update AGEN
   already-joined `streets` rows (never moving way ids or merging rows) and is not
   wired into `join`, so re-running `join` discards it and the `alias` command
   must be re-run.
-- **`cities` reads two sources**: comune boundaries come from the OSM dump
-  (`admin_level=8` relations are never stored in the database, which only holds
-  highway ways), while the ways come from the `extract` database — so `cities`
-  needs both the dump and a database `extract` has populated. The name match runs
-  in SQLite (`LIKE`) so only matched ways reach the point-in-polygon test.
-  Containment uses raw lon/lat (no metric projection), since a point-in-polygon
-  test is topological and needs no distance measurement.
 
 ### Dependencies
 

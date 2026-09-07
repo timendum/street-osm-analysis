@@ -9,6 +9,8 @@ commands. It wraps a single SQLite database (opened via the standard-library
 - ``streets`` — one row per produced street (name, norm_name, composing way ids).
 - ``street_groups`` — one row per norm_name: count of distinct streets sharing it.
 - ``done``    — the set of street names whose streets are fully committed.
+- ``squares`` — one row per named ``place=square``, reduced to a single point,
+  read by the ``cities`` command alongside the ways.
 
 A way's geometry lives in two BLOB columns — ``node_ids`` and ``coords`` — which
 dominate the on-disk size and are stored in a compact, lossless binary encoding
@@ -39,7 +41,7 @@ import zlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from strade.models import HighwayWay, NameGroup, NodeRef, Street
+from strade.models import HighwayWay, NameGroup, NodeRef, Square, Street
 from strade.normalize import normalize_name
 
 if TYPE_CHECKING:
@@ -88,6 +90,23 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         "count INTEGER NOT NULL)"
     ),
     "CREATE TABLE IF NOT EXISTS done (name TEXT PRIMARY KEY)",
+    # One row per named place=square (node/way/relation), reduced to a single
+    # representative point. Unlike ``ways`` a square carries no line/area
+    # geometry — the ``cities`` command needs only the point to test containment
+    # — so the table is deliberately lean. ``osm_id`` is the source element's own
+    # id and is not globally unique across OSM's separate node/way/relation id
+    # spaces, so it is not the primary key; rows are keyed by an autoincrement id.
+    (
+        "CREATE TABLE IF NOT EXISTS squares ("
+        "square_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "osm_id INTEGER NOT NULL, "
+        "name TEXT NOT NULL, "
+        "lon REAL NOT NULL, "
+        "lat REAL NOT NULL)"
+    ),
+    # The `cities` command matches squares by name with SQLite LIKE, so an index
+    # on name serves the same role as ways_by_norm_name does for ways.
+    "CREATE INDEX IF NOT EXISTS squares_by_name ON squares (name)",
 )
 
 
@@ -413,6 +432,69 @@ def clear_resume_cursor(conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM meta WHERE key = ?", (_META_LAST_WAY_ID,))
 
 
+# --- Extract side: square writer --------------------------------------------
+
+
+class SquareWriter:
+    """Insert named ``place=square`` points into the ``squares`` table.
+
+    Mirrors :class:`WayWriter`'s batching: each :meth:`append` buffers one row
+    and rows are flushed to SQLite in transactions of at most ``batch_size``.
+    Unlike the ways writer there is no resume cursor — squares are few (a few
+    thousand nationally) and are re-extracted in full on every run — so the
+    caller clears the table once up front (:func:`clear_squares`) and then
+    appends the whole set. ``close`` flushes any trailing partial batch, so
+    callers must ``close`` (or use the writer as a context manager).
+    """
+
+    def __init__(self, conn: sqlite3.Connection, batch_size: int = 1000) -> None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        self._conn = conn
+        self._batch_size = batch_size
+        # Buffered (osm_id, name, lon, lat) rows awaiting flush.
+        self._pending: list[tuple[int, str, float, float]] = []
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def append(self, square: Square) -> None:
+        """Buffer ``square`` for insertion, flushing once the batch is full."""
+        self._pending.append((square.osm_id, square.name, square.lon, square.lat))
+        if len(self._pending) >= self._batch_size:
+            self._flush()
+
+    def close(self) -> None:
+        """Flush any buffered squares so a trailing partial batch is persisted."""
+        self._flush()
+
+    def _flush(self) -> None:
+        """Commit the buffered rows in one transaction and clear the buffer."""
+        if not self._pending:
+            return
+        pending = self._pending
+        self._pending = []
+        with self._conn:
+            self._conn.executemany(
+                "INSERT INTO squares (osm_id, name, lon, lat) VALUES (?, ?, ?, ?)",
+                pending,
+            )
+
+
+def clear_squares(conn: sqlite3.Connection) -> None:
+    """Empty the ``squares`` table so a fresh ``extract`` repopulates it cleanly.
+
+    Squares carry no resume bookkeeping (the whole set is re-read each run), so
+    ``extract`` clears the table before the squares pass to avoid accumulating
+    duplicate rows across runs. Runs in its own transaction.
+    """
+    with conn:
+        conn.execute("DELETE FROM squares")
+
+
 # --- Join side: header, grouped read, and done-set -------------------------
 
 
@@ -731,10 +813,11 @@ class MatchedWay:
 
     Carries the raw ``name`` (for reporting/debugging) and a single
     representative ``(lon, lat)`` used for the point-in-polygon test that decides
-    which city the way falls in. The point is the way's first resolved vertex —
-    a cheap, stable choice: a way lying inside a comune has all of its vertices
-    inside it, and the point-in-polygon design already accepts that a way
-    straddling a border is attributed by a single representative point.
+    which city the way falls in. The point is the way's middle resolved vertex —
+    a cheap, stable choice that avoids the endpoints: a way's ends sit on the
+    shared border with a neighbouring comune, so an endpoint can fall in the
+    wrong comune, whereas the midpoint lies along the street's interior and
+    lands in the comune the street actually runs through.
     """
 
     name: str
@@ -748,9 +831,13 @@ def read_ways_matching(db: Path, patterns: list[str]) -> Iterator[MatchedWay]:
     Builds a single ``WHERE name LIKE ? OR name LIKE ? ...`` query from
     ``patterns`` (used verbatim as SQLite ``LIKE`` patterns, so ``%``/``_``
     wildcards apply and matching is ASCII-case-insensitive) and streams the
-    matching rows, decoding each way's packed ``coords`` to recover its first
-    resolved vertex as the representative point. A matched way with no resolved
-    coordinates is skipped, since it cannot be placed inside any city.
+    matching rows, decoding each way's packed ``coords`` to recover its middle
+    resolved vertex as the representative point. The middle vertex is preferred
+    over an endpoint because a way's ends sit on the shared border with a
+    neighbour, so an endpoint can fall in the wrong comune; the midpoint lies
+    along the street's interior and lands in the comune the street actually runs
+    through. A matched way with no resolved coordinates is skipped, since it
+    cannot be placed inside any city.
 
     The string matching runs entirely in SQLite, so only the (typically few)
     ways that already matched a pattern are decoded and handed back for the more
@@ -777,8 +864,45 @@ def read_ways_matching(db: Path, patterns: list[str]) -> Iterator[MatchedWay]:
             coords = deserialize_coords_binary(coords_blob)
             if not coords:
                 continue
-            first = coords[0]
-            yield MatchedWay(name=name, lon=first.lon, lat=first.lat)
+            # The middle vertex is the representative point: endpoints sit on the
+            # shared border with a neighbouring comune, so the midpoint is the
+            # stable interior choice for the point-in-polygon test.
+            mid = coords[len(coords) // 2]
+            yield MatchedWay(name=name, lon=mid.lon, lat=mid.lat)
+    finally:
+        conn.close()
+
+
+def read_squares_matching(db: Path, patterns: list[str]) -> Iterator[MatchedWay]:
+    """Stream one :class:`MatchedWay` per square whose ``name`` matches a pattern.
+
+    The square counterpart of :func:`read_ways_matching`: it builds the same
+    ``WHERE name LIKE ? OR ...`` query from ``patterns`` and streams the matching
+    ``squares`` rows, yielding each as a :class:`MatchedWay` (name plus the
+    square's stored representative point) so the ``cities`` command can feed
+    squares through the very same :func:`~strade.cities.assign_matches` path used
+    for ways. A square already *is* a single point, so no coordinate decoding is
+    needed.
+
+    ``patterns`` must be non-empty (an empty list would build an invalid query);
+    the ``cities`` command rejects an empty pattern file before calling this.
+    Opens and closes its own connection over the iterator's lifetime, so callers
+    should drive it to completion (or close it) to release the database handle.
+    """
+    if not patterns:
+        raise ValueError("read_squares_matching requires at least one LIKE pattern")
+
+    where = " OR ".join("name LIKE ?" for _ in patterns)
+    conn = connect(db)
+    try:
+        cursor = conn.execute(
+            # `where` is built only from the fixed "name LIKE ?" template, one
+            # per pattern; the patterns themselves are bound parameters below.
+            f"SELECT name, lon, lat FROM squares WHERE {where}",
+            patterns,
+        )
+        for name, lon, lat in cursor:
+            yield MatchedWay(name=name, lon=lon, lat=lat)
     finally:
         conn.close()
 

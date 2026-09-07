@@ -16,9 +16,11 @@ from typing import TYPE_CHECKING
 
 from pyproj import Transformer
 from shapely import LineString, Point
-from shapely.ops import nearest_points
+from shapely.ops import nearest_points, transform
 
 if TYPE_CHECKING:
+    from shapely.geometry.base import BaseGeometry
+
     from strade.models import HighwayWay
 
 # WGS84 lon/lat, the CRS OSM coordinates are expressed in.
@@ -64,6 +66,20 @@ class Projector:
         """
         x, y = self._transformer.transform(lon, lat)
         return float(x), float(y)
+
+    def transform_geometry(self, geometry: BaseGeometry) -> BaseGeometry:
+        """Project a whole WGS84 shapely geometry into the metric CRS.
+
+        Reprojects every vertex of ``geometry`` (a ``Polygon``/``MultiPolygon``,
+        etc.) through the cached transformer, so a comune boundary can be drawn
+        in meters — the ``cities`` map fills each comune's projected outline
+        rather than a single representative point. ``shapely.ops.transform``
+        rebuilds the geometry of the same type with the projected coordinates.
+        """
+        return transform(
+            lambda xs, ys: self._transformer.transform(xs, ys),
+            geometry,
+        )
 
     def to_metric_linestring(self, way: HighwayWay) -> LineString | None:
         """Build a projected shapely ``LineString`` from a way's resolved coords.

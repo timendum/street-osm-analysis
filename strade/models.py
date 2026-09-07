@@ -9,6 +9,8 @@ These dataclasses describe the records that flow through the pipeline:
   sorted, de-duplicated way ids.
 - ``CityArea``   — an OSM ``admin_level=8`` boundary with its identifying tags
   and assembled polygon, used by the ``cities`` command.
+- ``Square``     — a named ``place=square`` reduced to a single representative
+  point, used by the ``cities`` command alongside the highway ways.
 """
 
 from __future__ import annotations
@@ -106,9 +108,13 @@ class CityArea:
     except ``name`` may be absent in the dump and is then ``None``; ``name`` is
     also ``None`` for the (rare) boundary without a ``name`` tag.
 
-    Frozen because a parsed boundary never changes; the geometry is built once
-    from the area's rings while the OSM object is still live and then reused for
-    every containment test.
+    ``osm_id`` is the id of the source OSM element the boundary was assembled
+    from, and ``from_way`` records whether that element is a way (``True``) or a
+    relation (``False``).
+
+    ``admin_level`` is the boundary's ``admin_level`` tag value (as read from the
+    dump, e.g. ``"8"`` for a comune, ``"4"`` for a region, ``"2"`` for a
+    country). It is ``None`` only for the (rare) boundary without an ``admin_level`` tag.
     """
 
     name: str | None
@@ -116,4 +122,35 @@ class CityArea:
     istat: str | None
     catasto: str | None
     wikidata: str | None
+    osm_id: int
+    from_way: bool
     geometry: BaseGeometry | Polygon
+    admin_level: str | None = None
+
+    @property
+    def osm_ref(self) -> str:
+        """Human-readable OSM reference, e.g. ``relation/45690`` or ``way/123``.
+
+        Prefixes ``osm_id`` with the source element type so the reference is
+        unambiguous across OSM's separate node/way/relation id spaces.
+        """
+        return f"{'way' if self.from_way else 'relation'}/{self.osm_id}"
+
+
+@dataclass(frozen=True)
+class Square:
+    """A named ``place=square`` reduced to a single representative point.
+
+    OSM maps a square as a node, a closed way (area), or a multipolygon
+    relation. All three are collapsed to one ``(lon, lat)`` point here — a node's
+    own coordinate, or a polygon's representative interior point — because the
+    ``cities`` command only needs a single point to test which comune the square
+    falls in. Only named squares are extracted, so ``name`` is never ``None``.
+
+    ``osm_id`` is the source OSM element's own id.
+    """
+
+    osm_id: int
+    name: str
+    lon: float
+    lat: float

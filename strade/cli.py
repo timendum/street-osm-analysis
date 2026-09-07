@@ -19,7 +19,13 @@ from tqdm import tqdm
 
 from strade import store
 from strade.aliases import AliasError, check_consistency, parse_alias_file, unknown_keys
-from strade.cities import assign_matches, build_city_index, write_csv
+from strade.cities import (
+    RegionError,
+    assign_matches,
+    build_city_index,
+    select_comuni,
+    write_csv,
+)
 from strade.collector import collect
 from strade.geometry import Projector
 from strade.joiner import (
@@ -28,8 +34,8 @@ from strade.joiner import (
     join_group,
     print_candidate_pairs,
 )
-from strade.mapper import build_grid, render_map
-from strade.parser import parse_admin_areas, parse_highways
+from strade.mapper import build_grid, render_cities_map, render_map
+from strade.parser import parse_admin_areas, parse_highways, parse_squares
 from strade.patterns import PatternError, parse_pattern_file
 from strade.prefixes import format_counts, scan_first_words
 from strade.reporter import Reporter
@@ -68,6 +74,14 @@ DEFAULT_MIN_STREETS = 42
 
 # Image suffix appended to the derived default `map` output path.
 MAP_SUFFIX = ".png"
+
+# CSV suffix appended to the derived default `cities` output path.
+CITIES_SUFFIX = ".csv"
+
+# Sentinel for `cities -m/--map` given without a path: parse_args replaces it
+# with the path derived from the database + pattern file. Distinct object so it
+# is never mistaken for a user-supplied path.
+_MAP_DEFAULT_PATH = Path("\0cities-map-default")
 
 
 @dataclass(frozen=True)
@@ -173,9 +187,10 @@ class CitiesOptions:
     """Resolved options for the ``cities`` command.
 
     Reads ``admin_level=8`` comune boundaries from the OSM dump and the named
-    ways from the ``extract`` database, then reports (as CSV on stdout) for each
-    comune whether it contains at least one street whose name matches a
-    ``LIKE`` pattern from ``pattern_path``. ``database_path`` defaults to the
+    ways from the ``extract`` database, then reports (as a CSV file named
+    ``<database>-<pattern_file>.csv`` beside the database) for each comune
+    whether it contains at least one street whose name matches a ``LIKE``
+    pattern from ``pattern_path``. ``database_path`` defaults to the
     dump path with a ``.db`` extension (like ``extract``) when the optional
     ``database`` positional is omitted; the pattern file has no default and must
     be supplied.
@@ -184,6 +199,8 @@ class CitiesOptions:
     input_path: Path  # OSM dump, read for comune boundaries
     database_path: Path  # SQLite checkpoint produced by `extract`, read for ways
     pattern_path: Path  # file of SQLite LIKE patterns, one per line
+    region_id: int | None  # parent admin boundary (region/country) to clip to, or None
+    map_path: Path | None  # image to render the comune choropleth to, or None to skip
     verbosity: int  # reporter verbosity level (incremented per -v)
 
 
@@ -207,6 +224,31 @@ def default_map_output_path(database_path: Path, target: str) -> Path:
     (``aosta.db`` + ``roma`` -> ``aosta-roma.png``).
     """
     return database_path.with_name(f"{database_path.stem}-{target}{MAP_SUFFIX}")
+
+
+def default_cities_output_path(database_path: Path, pattern_path: Path) -> Path:
+    """Derive the ``cities`` CSV output path from the database and pattern file.
+
+    Concatenates the database file's stem with the pattern file's stem and a
+    ``.csv`` extension, keeping the file in the database's directory, so running
+    different pattern files against one database yields distinct reports
+    (``aosta.db`` + ``name-roma.txt`` -> ``aosta-name-roma.csv``).
+    """
+    return database_path.with_name(
+        f"{database_path.stem}-{pattern_path.stem}{CITIES_SUFFIX}"
+    )
+
+
+def default_cities_map_path(database_path: Path, pattern_path: Path) -> Path:
+    """Derive the ``cities`` map image path from the database and pattern file.
+
+    Mirrors :func:`default_cities_output_path` but with a ``.png`` extension, so
+    the optional comune choropleth lands beside its CSV report with a matching
+    stem (``aosta.db`` + ``name-roma.txt`` -> ``aosta-name-roma.png``).
+    """
+    return database_path.with_name(
+        f"{database_path.stem}-{pattern_path.stem}{MAP_SUFFIX}"
+    )
 
 
 def default_database_path(input_path: Path) -> Path:
@@ -433,9 +475,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "cities",
         parents=[common],
         help=(
-            "For every admin_level=8 comune boundary in the dump, report as CSV "
+            "For every admin_level=8 comune boundary in the dump, report "
             "whether it contains at least one street whose name matches a LIKE "
-            "pattern from the pattern file."
+            "pattern from the pattern file, written to a "
+            "<database>-<pattern_file>.csv file beside the database."
         ),
     )
     cities.add_argument(
@@ -458,6 +501,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Path to the SQLite checkpoint produced by `extract` (read for the "
             "ways). Defaults to the dump path with a .db extension."
+        ),
+    )
+    cities.add_argument(
+        "-r",
+        "--region",
+        dest="region",
+        type=int,
+        default=None,
+        help=(
+            "OSM relation id of a parent admin boundary to optionaly clip the report to."
+        ),
+    )
+    # -m/--map optionally renders a comune choropleth alongside the CSV: warm
+    # comuni matched, cold ones did not. Given with no value (const) it defaults
+    # the path beside the CSV; given a value that path is used; absent (default
+    # None) no map is rendered. The sentinel distinguishes "flag given, no path"
+    # from "flag absent".
+    cities.add_argument(
+        "-m",
+        "--map",
+        dest="map_path",
+        metavar="PATH",
+        type=Path,
+        nargs="?",
+        const=_MAP_DEFAULT_PATH,
+        default=None,
+        help=(
+            "Also render a comune choropleth (warm=matched, cold=not) to PATH. "
+            "With no PATH, defaults to the CSV path with a .png extension; "
+            "omit the flag entirely to skip the map."
         ),
     )
 
@@ -530,10 +603,18 @@ def parse_args(
         database = args.database
         if database is None:
             database = default_database_path(args.input)
+        # Resolve the optional map path: absent -> None (no map); given without a
+        # value -> the sentinel, replaced by the CSV-adjacent default; given a
+        # value -> that path.
+        map_path = args.map_path
+        if map_path is _MAP_DEFAULT_PATH:
+            map_path = default_cities_map_path(database, args.patterns)
         return CitiesOptions(
             input_path=args.input,
             database_path=database,
             pattern_path=args.patterns,
+            region_id=args.region,
+            map_path=map_path,
             verbosity=args.verbosity,
         )
 
@@ -560,6 +641,12 @@ def run_extract(options: ExtractOptions, reporter: Reporter) -> int:
     the ``ways`` table while unnamed ways are excluded and counted.
     Parsing resumes past the last committed way id, so re-running after an
     interruption continues where it left off.
+
+    A second pass then extracts every named ``place=square`` element (node, way,
+    or relation, each reduced to a single representative point) into the
+    ``squares`` table, which the ``cities`` command reads alongside the ways.
+    This pass carries no resume bookkeeping — squares are few — so the table is
+    cleared and repopulated in full on every run.
 
     A fatal input error (missing file, unsupported format) is reported via the
     Reporter and mapped to a non-zero exit code. On success
@@ -596,8 +683,21 @@ def run_extract(options: ExtractOptions, reporter: Reporter) -> int:
         # committed. Drop the resume cursor so a re-run starts clean instead of
         # treating this finished database as a partial checkpoint.
         store.clear_resume_cursor(conn)
+
+        # Second pass: extract named place=square elements into the squares
+        # table, read by the `cities` command alongside the ways. Squares are few
+        # (a few thousand nationally) and carry no resume bookkeeping, so the
+        # table is cleared and repopulated in full on every run.
+        store.clear_squares(conn)
+        square_count = 0
+        with store.SquareWriter(conn) as square_writer:
+            for square in parse_squares(options.input_path, fmt, reporter):
+                square_writer.append(square)
+                square_count += 1
     finally:
         conn.close()
+
+    reporter.progress(f"extract: wrote {square_count} named square(s)")
 
     # Group count comes from the persisted ways table (COUNT(DISTINCT name)).
     header = store.read_header(options.database_path)
@@ -922,14 +1022,23 @@ def run_cities(options: CitiesOptions, reporter: Reporter) -> int:
     """Run the ``cities`` command; returns the process exit code.
 
     Validates the OSM dump, then reads the LIKE-pattern file (a file with no
-    usable pattern is a fatal error). It streams the dump's ``admin_level=8``
-    comune boundaries into a :class:`~strade.cities.CityIndex` (a spatial index
-    for point-in-polygon lookup), then streams only the ways whose name matches a
-    pattern from the ``extract`` database
+    usable pattern is a fatal error). It reads the dump's administrative
+    boundaries and, when ``--region`` names a parent boundary, drops comuni that
+    spilled into the dump from across that region's border
+    (:func:`~strade.cities.select_comuni`); a region id absent from the dump is a
+    fatal error. The kept comuni go into a :class:`~strade.cities.CityIndex` (a
+    spatial index for point-in-polygon lookup), then it streams only the ways
+    whose name matches a pattern from the ``extract`` database
     (:func:`~strade.store.read_ways_matching`) and flags the comune each matching
-    way falls in. Finally it writes one CSV row per comune to standard output —
-    the identifying tags plus a ``true``/``false`` ``matched`` column — keeping
-    all progress and warnings on stderr via the reporter.
+    way falls in. It repeats the same match over the ``squares`` table
+    (:func:`~strade.store.read_squares_matching`), so a comune counts as matched
+    when either a highway way or a ``place=square`` (node/way/relation) with a
+    matching name falls inside it. Finally it writes one CSV row per comune to a
+    file named
+    ``<database>-<pattern_file>.csv`` beside the database (via
+    :func:`default_cities_output_path`) — the identifying tags plus a
+    ``true``/``false`` ``matched`` column — keeping all progress and warnings on
+    stderr via the reporter.
 
     A fatal input error (missing/unsupported dump, missing database, or an empty
     pattern file) is reported via the reporter and mapped to a non-zero exit
@@ -959,11 +1068,18 @@ def run_cities(options: CitiesOptions, reporter: Reporter) -> int:
         f"cities: matching {len(patterns)} pattern(s) against streets in comuni"
     )
 
-    # Pass 1: build the comune spatial index from the dump's boundaries.
-    index = build_city_index(
-        parse_admin_areas(options.input_path, fmt, reporter),
-        reporter,
-    )
+    # Pass 1: read the dump's admin boundaries (comuni plus parent levels), then
+    # optionally clip to a region before building the comune spatial index.
+    try:
+        comuni = select_comuni(
+            parse_admin_areas(options.input_path, fmt, reporter),
+            options.region_id,
+            reporter,
+        )
+    except RegionError as exc:
+        reporter.warn(str(exc))
+        return reporter.exit_code or 1
+    index = build_city_index(comuni, reporter)
 
     # Pass 2: stream only the pattern-matched ways from the database and flag the
     # comune each one falls in. The string match runs in SQLite, so the (usually
@@ -971,13 +1087,36 @@ def run_cities(options: CitiesOptions, reporter: Reporter) -> int:
     matched_ways = store.read_ways_matching(options.database_path, patterns)
     consumed = assign_matches(index, matched_ways)
 
-    rows = write_csv(index.matches, sys.stdout)
+    # Squares (place=square nodes/ways/relations) are a second point source that
+    # highway ways miss — e.g. a "Piazza Roma" mapped only as a node. Match them
+    # by the same patterns and flag their comuni through the same index, so a
+    # comune counts as matched if either a way or a square falls inside it.
+    matched_squares = store.read_squares_matching(options.database_path, patterns)
+    consumed += assign_matches(index, matched_squares)
+
+    output_path = default_cities_output_path(options.database_path, options.pattern_path)
+    with output_path.open("w", encoding="utf-8", newline="") as stream:
+        rows = write_csv(index.matches, stream)
 
     hit = sum(1 for match in index.matches if match.matched)
     reporter.progress(
         f"cities: {hit} of {rows} comune(i) matched "
-        f"({consumed} matching street(s) placed)"
+        f"({consumed} matching street(s) placed); wrote {output_path}"
     )
+
+    # Optionally render the comune choropleth beside the CSV: each comune's
+    # boundary geometry filled warm when matched, cold when not. Reprojected to
+    # the metric CRS so the outlines are undistorted.
+    if options.map_path is not None:
+        drawn = render_cities_map(
+            index.matches,
+            options.map_path,
+            display_name=options.pattern_path.stem,
+        )
+        reporter.progress(
+            f"cities: mapped {drawn} comune boundary(ies) -> {options.map_path}"
+        )
+
     # 0 when no non-fatal warnings were recorded, else non-zero.
     return reporter.exit_code
 

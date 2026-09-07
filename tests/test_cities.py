@@ -23,12 +23,16 @@ def _square(x0: float, y0: float, x1: float, y1: float) -> Polygon:
 
 
 def _city(name: str, poly: Polygon, **tags: str | None) -> CityArea:
+    osm_id = tags.get("osm_id")
+    from_way = tags.get("from_way")
     return CityArea(
         name=name,
         postal_code=tags.get("postal_code"),
         istat=tags.get("istat"),
         catasto=tags.get("catasto"),
         wikidata=tags.get("wikidata"),
+        osm_id=int(osm_id) if osm_id is not None else 1,
+        from_way=bool(from_way),
         geometry=poly,
     )
 
@@ -144,8 +148,10 @@ class WriteCsvTest(unittest.TestCase):
             istat="035033",
             catasto="H223",
             wikidata="Q13361",
+            osm_id="43125",
         )
-        b = _city("Bard", _square(2, 2, 3, 3), istat="007009")
+        # A way-sourced boundary renders with a way/ prefix instead of relation/.
+        b = _city("Bard", _square(2, 2, 3, 3), istat="007009", osm_id="99", from_way="1")
         index = CityIndex([a, b])
         index.mark_point(0.5, 0.5)  # flags A only
 
@@ -154,26 +160,34 @@ class WriteCsvTest(unittest.TestCase):
         lines = out.getvalue().splitlines()
 
         self.assertEqual(rows, 2)
-        self.assertEqual(lines[0], "name,postal_code,istat,catasto,wikidata,matched")
+        self.assertEqual(
+            lines[0], "name,postal_code,istat,catasto,wikidata,osm_id,matched"
+        )
         # A matched; the comma in the name forces quoting.
         self.assertEqual(
-            lines[1], '"Reggio nell\'Emilia, città",42100,035033,H223,Q13361,true'
+            lines[1],
+            '"Reggio nell\'Emilia, città",42100,035033,H223,Q13361,relation/43125,true',
         )
         # B did not match; absent tags render as empty fields.
-        self.assertEqual(lines[2], "Bard,,007009,,,false")
+        self.assertEqual(lines[2], "Bard,,007009,,,way/99,false")
 
     def test_name_without_comma_is_not_quoted(self) -> None:
         # A slash (Aosta / Aoste) is not a CSV special char, so no quoting.
-        a = _city("Aosta / Aoste", _square(0, 0, 1, 1), postal_code="11100")
+        a = _city(
+            "Aosta / Aoste", _square(0, 0, 1, 1), postal_code="11100", osm_id="45489"
+        )
         out = io.StringIO()
         write_csv(CityIndex([a]).matches, out)
-        self.assertEqual(out.getvalue().splitlines()[1], "Aosta / Aoste,11100,,,,false")
+        self.assertEqual(
+            out.getvalue().splitlines()[1],
+            "Aosta / Aoste,11100,,,,relation/45489,false",
+        )
 
     def test_none_name_renders_empty(self) -> None:
-        c = _city(None, _square(0, 0, 1, 1))  # type: ignore[arg-type]
+        c = _city("", _square(0, 0, 1, 1), osm_id="7")
         out = io.StringIO()
         write_csv(CityIndex([c]).matches, out)
-        self.assertEqual(out.getvalue().splitlines()[1], ",,,,,false")
+        self.assertEqual(out.getvalue().splitlines()[1], ",,,,,relation/7,false")
 
 
 class ReadWaysMatchingTest(unittest.TestCase):
@@ -229,10 +243,12 @@ class ReadWaysMatchingTest(unittest.TestCase):
         # coords so it is dropped.
         self.assertEqual(names, ["Via Roma"])
 
-    def test_first_vertex_is_the_representative_point(self) -> None:
+    def test_middle_vertex_is_the_representative_point(self) -> None:
+        # Via Roma has vertices [(7.32, 45.74), (7.33, 45.75)]; the middle index
+        # (len // 2 == 1) picks the second vertex, avoiding the border-prone ends.
         (way,) = store.read_ways_matching(self.db, ["Via Roma"])
-        self.assertAlmostEqual(way.lon, 7.32)
-        self.assertAlmostEqual(way.lat, 45.74)
+        self.assertAlmostEqual(way.lon, 7.33)
+        self.assertAlmostEqual(way.lat, 45.75)
 
     def test_multiple_patterns_are_ored(self) -> None:
         ways = list(store.read_ways_matching(self.db, ["%roma%", "%garibaldi%"]))
