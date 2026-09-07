@@ -81,36 +81,27 @@ def parse_highways(
     reporter: Reporter,
     resume_after_way_id: int | None = None,
 ) -> Iterator[HighwayWay]:
-    """Yield a :class:`HighwayWay` for every highway way in the dump.
+    """Yield a :class:`HighwayWay` for every ``highway``-tagged way in the dump.
 
-    Streams ``path`` with pyosmium, attaching each referenced node's coordinate
-    from the location cache.
+    Node coordinates are resolved from pyosmium's location cache; references
+    with no location are dropped and reported, and a way left with fewer than
+    two nodes is dropped with a warning.
 
     Args:
         path: Filesystem path to the OSM dump.
-        fmt: The detected input format (see :mod:`strade.validation`); accepted
-            for interface symmetry with the rest of the pipeline. pyosmium
-            infers the concrete reader from the file itself, so this argument is
-            not otherwise consumed.
-        reporter: Sink for non-fatal warnings about missing node references and
-            dropped ways.
-        resume_after_way_id: When set, every way whose id is at or below this
-            cursor is skipped before any other work, so already-committed ways
-            are neither re-emitted nor re-warned.
-
-    Yields:
-        One :class:`HighwayWay` per way carrying a ``highway`` tag,
-        with its ordered ``node_ids`` and the resolved ``coords`` of
-        every node whose location is present in the dump. Ways without
-        a ``highway`` tag are skipped; a way left with fewer than two
-        resolved nodes after dropping missing references is dropped with a
-        warning.
+        fmt: Detected input format; accepted for interface symmetry (pyosmium
+            infers the reader from the file).
+        reporter: Sink for non-fatal warnings about missing nodes and dropped
+            ways.
+        resume_after_way_id: When set, ways with an id at or below this cursor
+            are skipped, so a resumed run neither re-emits nor re-warns them.
     """
     del fmt  # pyosmium detects the reader from the file; kept for interface symmetry.
 
     processor = (
         osmium.FileProcessor(str(path))
         .with_locations()
+        .with_filter(osmium.filter.KeyFilter("highway").enable_for(osmium.osm.WAY))
         .with_filter(osmium.filter.EntityFilter(osmium.osm.WAY))
     )
 
@@ -124,7 +115,8 @@ def parse_highways(
     )
 
     for way in ways:
-        # The EntityFilter(WAY) above guarantees only ways are yielded.
+        # The filters above guarantee only ways carrying a ``highway`` tag are
+        # yielded.
         assert isinstance(way, osmium.osm.Way)
 
         way_id = way.id
@@ -132,11 +124,6 @@ def parse_highways(
         # Resume: drop the already-committed prefix before any other work so no
         # warning is re-raised for a way handled before the interruption.
         if resume_after_way_id is not None and way_id <= resume_after_way_id:
-            continue
-
-        highway = way.tags.get("highway")
-        if highway is None:
-            # Not a road-like feature.
             continue
 
         node_ids, coords, missing = _resolve_nodes(way)
