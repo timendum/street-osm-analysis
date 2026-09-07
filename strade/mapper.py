@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from pathlib import Path
 
+    from strade.cities import CityMatch
     from strade.store import StreetPoint
 
 
@@ -321,3 +322,112 @@ def render_map(grid: Grid, output_path: Path) -> None:
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def render_cities_map(
+    matches: Iterable[CityMatch],
+    output_path: Path,
+    display_name: str,
+    projector: Projector | None = None,
+) -> int:
+    """Render the ``cities`` result as a filled comune map to ``output_path``.
+
+    Draws every comune's boundary geometry, reprojected into the metric CRS (via
+    ``projector``, default :class:`~strade.geometry.Projector`) so the outlines
+    are undistorted, and fills each polygon by its match flag: a warm colour when
+    the comune contains at least one matching street/square, a cold colour when
+    it does not. This is the geometric counterpart to the CSV — a comune-level
+    choroplith of where the pattern was found — rather than the ``map`` command's
+    density-normalized street grid.
+
+    ``matches`` is consumed once; each :class:`~strade.cities.CityMatch` carries
+    the comune's raw WGS84 boundary (``match.area.geometry``) and its ``matched``
+    flag. A comune with an empty geometry is skipped. ``display_name`` labels the
+    plot (e.g. the pattern file's stem, or the searched name). Returns the number
+    of comuni drawn.
+
+    The figure is saved (not shown) with the non-interactive ``Agg`` backend,
+    selected before importing pyplot, so the command stays headless. A
+    ``MultiPolygon`` comune is drawn as each of its component polygons.
+    """
+    import matplotlib as mpl
+
+    mpl.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import PatchCollection
+    from matplotlib.patches import Patch
+    from matplotlib.patches import Polygon as MplPolygon
+
+    if projector is None:
+        projector = Projector()
+
+    # Warm = matched, cold = not matched; deliberate two-colour choropleth.
+    matched_color = "#d73027"  # warm red
+    unmatched_color = "#4575b4"  # cold blue
+
+    fig, ax = plt.subplots(figsize=(10, 12))
+
+    matched_patches: list[MplPolygon] = []
+    unmatched_patches: list[MplPolygon] = []
+    drawn = 0
+    for match in matches:
+        geometry = match.area.geometry
+        if geometry is None or geometry.is_empty:
+            continue
+        projected = projector.transform_geometry(geometry)
+        # A comune may be a single Polygon or a MultiPolygon; iterate the parts
+        # uniformly so each ring becomes its own filled patch.
+        parts = getattr(projected, "geoms", [projected])
+        bucket = matched_patches if match.matched else unmatched_patches
+        for part in parts:
+            if part.is_empty:
+                continue
+            bucket.append(MplPolygon(list(part.exterior.coords)))
+        drawn += 1
+
+    if unmatched_patches:
+        ax.add_collection(
+            PatchCollection(
+                unmatched_patches,
+                facecolor=unmatched_color,
+                edgecolor="white",
+                linewidth=0.2,
+            )
+        )
+    if matched_patches:
+        ax.add_collection(
+            PatchCollection(
+                matched_patches,
+                facecolor=matched_color,
+                edgecolor="white",
+                linewidth=0.2,
+            )
+        )
+
+    if matched_patches or unmatched_patches:
+        ax.legend(
+            handles=[
+                Patch(facecolor=matched_color, edgecolor="white", label="matched"),
+                Patch(facecolor=unmatched_color, edgecolor="white", label="not matched"),
+            ],
+            loc="lower right",
+            fontsize="small",
+        )
+        ax.autoscale_view()
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            "no comune boundaries to map",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+
+    ax.set_aspect("equal")
+    ax.set_axis_off()
+    ax.set_title(f"Comuni matching '{display_name}'")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return drawn
