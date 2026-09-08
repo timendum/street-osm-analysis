@@ -180,7 +180,7 @@ class WriteCsvTest(unittest.TestCase):
         index.mark_point(0.5, 0.5)  # flags A only
 
         out = io.StringIO()
-        rows = write_csv(index.matches, out)
+        rows = write_csv(index.matches, out, None)
         lines = out.getvalue().splitlines()
 
         self.assertEqual(rows, 2)
@@ -194,6 +194,7 @@ class WriteCsvTest(unittest.TestCase):
         )
         # B did not match; absent tags render as empty fields.
         self.assertEqual(lines[2], "Bard,,007009,,,way/99,false")
+        self.assertEqual(lines[3], "Total,,,,,,1")
 
     def test_name_without_comma_is_not_quoted(self) -> None:
         # A slash (Aosta / Aoste) is not a CSV special char, so no quoting.
@@ -201,7 +202,7 @@ class WriteCsvTest(unittest.TestCase):
             "Aosta / Aoste", _square(0, 0, 1, 1), postal_code="11100", osm_id="45489"
         )
         out = io.StringIO()
-        write_csv(CityIndex([a]).matches, out)
+        write_csv(CityIndex([a]).matches, out, None)
         self.assertEqual(
             out.getvalue().splitlines()[1],
             "Aosta / Aoste,11100,,,,relation/45489,false",
@@ -210,7 +211,7 @@ class WriteCsvTest(unittest.TestCase):
     def test_none_name_renders_empty(self) -> None:
         c = _city("", _square(0, 0, 1, 1), osm_id="7")
         out = io.StringIO()
-        write_csv(CityIndex([c]).matches, out)
+        write_csv(CityIndex([c]).matches, out, None)
         self.assertEqual(out.getvalue().splitlines()[1], ",,,,,relation/7,false")
 
 
