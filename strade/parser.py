@@ -1,28 +1,12 @@
-"""Streaming OSM parser: emit highway ways with resolved node coordinates.
+"""Streaming pyosmium readers for the extract and cities passes.
 
-Wraps pyosmium (the ``osmium`` package) to stream an OSM dump and yield one
-:class:`~strade.models.HighwayWay` for every way carrying a ``highway`` tag
-. Node coordinates come from pyosmium's built-in node-location
-cache: :meth:`~osmium.FileProcessor.with_locations` keeps the coordinate of
-every node it reads and attaches it to each way's node references, so a way's
-geometry is resolved in a single streaming pass without a manual node index
-.
-
-An :class:`~osmium.filter.EntityFilter` restricted to ways is installed *after*
-location caching, so nodes still populate the cache while only ways reach the
-iterator body. Way references whose location is absent from the dump (an invalid
-location) are omitted and reported via the :class:`~strade.reporter.Reporter`
-.
-
-libosmium visits ways in ascending id order within a run, so ``resume_after_way_id``
-is a cheap prefix skip: every way with an id at or below the cursor is dropped
-before any other work, so a resumed run neither re-emits committed ways nor
-re-raises their warnings.
-
-Two further readers back the ``cities`` command: ``parse_admin_areas`` yields a
-:class:`~strade.models.CityArea` per administrative boundary, and
-``parse_squares`` a :class:`~strade.models.Square` per named ``place=square``
-element, each reduced to a representative point.
+- ``parse_highways`` yields a :class:`~strade.models.HighwayWay` per
+  ``highway``-tagged way, with node coordinates resolved from pyosmium's
+  location cache and resume via a way-id cursor.
+- ``parse_admin_areas`` yields a :class:`~strade.models.CityArea` per
+  administrative boundary at the levels ``cities`` reads.
+- ``parse_squares`` yields a :class:`~strade.models.Square` per named
+  ``place=square`` element, reduced to a representative point.
 """
 
 from __future__ import annotations
@@ -151,12 +135,11 @@ def parse_highways(
 
 
 def _resolve_nodes(way: osmium.osm.Way) -> tuple[list[int], list[NodeRef], int]:
-    """Split a way's node references into ordered ids, resolved coords, and a miss count.
+    """Split a way's nodes into ordered ids, resolved coords, and a miss count.
 
-    ``node_ids`` keeps every referenced id in order. ``coords`` holds a
-    :class:`NodeRef` for each node whose cached location is valid; a
-    node whose location is absent from the dump is omitted from ``coords`` and
-    counted in ``missing``.
+    ``node_ids`` keeps every referenced id in order; ``coords`` holds a
+    :class:`NodeRef` per node with a valid location, and ``missing`` counts
+    those omitted.
     """
     node_ids: list[int] = []
     coords: list[NodeRef] = []
@@ -178,18 +161,13 @@ def parse_admin_areas(
 ) -> Iterator[CityArea]:
     """Yield a :class:`CityArea` for each administrative boundary in the dump.
 
-    Drives pyosmium's area builder over a ``boundary=administrative`` filter,
+    Uses pyosmium's area builder over a ``boundary=administrative`` filter,
     keeping the levels in :data:`_ADMIN_LEVELS` (comune ``8`` plus the parent
-    ``2``/``4`` the ``cities`` region filter needs). Each :class:`CityArea`
-    carries its ``admin_level``, its geometry as a WGS84 ``MultiPolygon``, the
-    ``cities`` identifying tags (``name``, ``postal_code``, ``ref:ISTAT``,
-    ``ref:catasto``, ``wikidata``; missing tags become ``None``) and its OSM
-    id/type (``orig_id()``/``from_way()``). Way-sourced areas (single boundary
-    segments) and off-level areas are skipped.
+    ``2``/``4`` the ``cities`` region filter needs). Way-sourced and off-level
+    areas are skipped.
 
-    ``fmt`` is accepted for interface symmetry only. Boundaries whose geometry
-    fails to assemble are dropped with a warning via ``reporter`` rather than
-    aborting the scan.
+    ``fmt`` is accepted for interface symmetry. Boundaries that fail to assemble
+    are dropped with a warning via ``reporter`` rather than aborting the scan.
     """
     del fmt  # pyosmium detects the reader from the file; kept for interface symmetry.
 
@@ -271,14 +249,12 @@ def parse_squares(
     """Yield a :class:`Square` for every named ``place=square`` in the dump.
 
     OSM maps a square as a node, a closed way, or a multipolygon relation; all
-    three are reduced to one representative ``(lon, lat)`` point, which is all
-    the ``cities`` containment test needs. A node uses its own coordinate; an
-    assembled way/relation area uses its polygon's ``representative_point()``
-    (guaranteed interior, unlike a centroid).
+    three are reduced to one representative ``(lon, lat)`` point. A node uses its
+    own coordinate; an area uses its polygon's ``representative_point()``.
 
-    Only named squares are yielded. ``fmt`` is accepted for interface symmetry
-    only. Squares whose geometry fails to assemble are dropped with a warning
-    via ``reporter`` rather than aborting the scan.
+    Only named squares are yielded. ``fmt`` is accepted for interface symmetry.
+    Squares that fail to assemble are dropped with a warning via ``reporter``
+    rather than aborting the scan.
     """
     del fmt  # pyosmium detects the reader from the file; kept for interface symmetry.
 

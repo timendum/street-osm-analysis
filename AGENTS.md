@@ -65,8 +65,8 @@ If a edit change something written here, ask the user if he wants to update AGEN
 
 ### Module map (`strade/`)
 
-- `cli.py` — argument parsing and the `run_xxx` orchestration;
-  console entry point `main` (also reachable via `main.py`).
+- `cli.py` — argument parsing and the `run_xxx` orchestration.  
+  Console entry point `main` (also reachable via `main.py`).
 - `parser.py` — streaming pyosmium readers:
   - `parse_highways` yields a `HighwayWay` per `highway`-tagged way, resolving
   node coordinates in one pass and supporting resume via a way-id cursor.
@@ -95,7 +95,6 @@ If a edit change something written here, ask the user if he wants to update AGEN
 - `mapper.py` — the `map` command's pure aggregation and rendering: `build_grid`
   bins streets into a square metric grid and computes each cell's target share,
   and `render_map` draws the coloured grid to an image with matplotlib.
-- `writer.py` — prints the top street-group summary.
 - `models.py` — core dataclasses: `NodeRef`, `HighwayWay`, `NameGroup`, `Street`,
   `CityArea`, and `Square`.
 - `prefixes.py` — first-word scan for discovering unhandled street-type prefixes.
@@ -133,4 +132,4 @@ If a edit change something written here, ask the user if he wants to update AGEN
 ### Dependencies
 
 `osmium` (pyosmium), `pyproj`, `shapely`, `tqdm`, `matplotlib` (the `map`
-command's rendering). Python >= 3.13.
+and optionaly `cities` command's rendering). Python >= 3.13.

@@ -1,35 +1,20 @@
 """SQLite-backed pipeline store: schema, connection, and (de)serialization.
 
-This module owns the on-disk boundary between the ``extract`` and ``join``
-commands. It wraps a single SQLite database (opened via the standard-library
-``sqlite3`` module) and holds all pipeline state in four tables:
+Owns the on-disk boundary between the ``extract`` and ``join`` commands. Holds
+all pipeline state in one SQLite database with these tables:
 
-- ``ways``    — one row per named highway way, in dump order, indexed by name.
+- ``ways``    — one row per named highway way, indexed by name.
 - ``meta``    — key/value bookkeeping (resume cursor, parsed/unnamed counts).
 - ``streets`` — one row per produced street (name, norm_name, composing way ids).
 - ``street_groups`` — one row per norm_name: count of distinct streets sharing it.
 - ``done``    — the set of street names whose streets are fully committed.
-- ``squares`` — one row per named ``place=square``, reduced to a single point,
-  read by the ``cities`` command alongside the ways.
+- ``squares`` — one row per named ``place=square`` point, read by ``cities``.
 
-A way's geometry lives in two BLOB columns — ``node_ids`` and ``coords`` — which
-dominate the on-disk size and are stored in a compact, lossless binary encoding
-(see the serialization section for the format). The raw ``name`` is stored as
-SQLite ``TEXT`` to preserve exact Unicode, including diacritics, so the
-human-readable name is never lossy. Each
-row also carries a ``norm_name`` — the language- and type-agnostic grouping key
-from :func:`strade.normalize.normalize_name` — computed once at write time so the
-join-side grouped read can stream rows already ordered by that key.
-
-The database is opened in WAL mode with ``synchronous = NORMAL`` so each
-``COMMIT`` is durable while keeping write throughput high; every unit of work is
-committed in its own transaction, so a crash rolls back at most the in-flight
-transaction.
-
-This module covers schema, connection, (de)serialization, the extract-side
-``WayWriter`` with its resume cursor and meta counters, and the join-side
-grouped read (``read_header`` / ``read_groups``) with the ``DoneSet`` used to
-skip already-committed groups on resume.
+Way geometry is stored in two BLOB columns (``node_ids`` and ``coords``) using a
+compact binary encoding; ``name`` is TEXT and each row carries the ``norm_name``
+grouping key so the join side can stream rows already ordered by that key. The
+database uses WAL mode with ``synchronous = NORMAL``, and every unit of work is
+committed in its own transaction.
 """
 
 from __future__ import annotations

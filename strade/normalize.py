@@ -1,37 +1,18 @@
-"""Normalize street names to a grouping key that ignores type and language.
+"""Derive a street-name grouping key that ignores street type and language.
 
-Valle d'Aosta is officially bilingual, so OSM carries the same street under
-several surface forms that all name the *same* physical street:
-
-- an Italian-only form: ``Viale Giuseppe Garibaldi``
-- a bilingual form with both street types: ``Viale - Avenue Giuseppe Garibaldi``
-- separator variants: ``Corso / Avenue Père-Laurent`` vs ``Corso - Avenue …``
-
-Grouping on the raw name (the pipeline's original behavior) keeps these apart, so
-the ways of one street never join. This module derives a *normalization key* that
-collapses those variants onto one value by:
-
-1. stripping the leading street-type word(s) (``Via``, ``Viale``, ``Piazza``,
-   ``Rue``, ``Avenue`` …), repeatedly, so a bilingual ``Viale - Avenue`` prefix is
-   removed in full; then
-2. reducing the remainder to lowercase ASCII letters and digits — diacritics are
-   folded (``é`` → ``e``), and every separator and space is dropped while digits
-   are kept.
-
-So ``Viale - Avenue Giuseppe Garibaldi`` and ``Viale Giuseppe Garibaldi`` both key
-to ``giuseppegaribaldi``. The key is only ever used to *group*; the human-readable
-name shown for a street is a representative raw name chosen elsewhere, so this lossy
-key never reaches the output.
+Bilingual (Italian/French) OSM data carries one physical street under several
+surface forms. The key collapses them by stripping leading street-type words and
+folding the rest to lowercase ASCII, so ``Viale - Avenue Giuseppe Garibaldi`` and
+``Viale Giuseppe Garibaldi`` both key to ``giuseppegaribaldi``. Used only for
+grouping; display uses a raw name chosen elsewhere.
 """
 
 from __future__ import annotations
 
 import unicodedata
 
-# Leading street-type words to strip, in Italian and French. Compared after
-# case-folding and diacritic removal, so entries are lowercase ASCII. A word is
-# only stripped when it appears at the start of the (remaining) name, and
-# stripping repeats so bilingual prefixes like "Viale - Avenue" are removed whole.
+# Leading street-type words to strip (Italian + French), as lowercase ASCII to
+# match the folded tokens. Stripped repeatedly from the name's start.
 _PREFIXES: frozenset[str] = frozenset(
     {
         # Italian
@@ -121,11 +102,9 @@ _PREFIXES: frozenset[str] = frozenset(
 
 
 def _fold_ascii(text: str) -> str:
-    """Fold ``text`` to lowercase and drop diacritics, keeping the letters.
+    """Fold ``text`` to lowercase and drop diacritics (``é`` -> ``e``).
 
-    Decomposes accented characters (NFKD) and discards the combining marks, so
-    ``é`` becomes ``e`` and ``ô`` becomes ``o``. Non-letters are left in place
-    here; callers decide what to keep.
+    Non-letters are left in place; callers decide what to keep.
     """
     decomposed = unicodedata.normalize("NFKD", text)
     without_marks = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
@@ -135,11 +114,8 @@ def _fold_ascii(text: str) -> str:
 def _strip_prefixes(tokens: list[str]) -> list[str]:
     """Drop leading tokens that are known street-type words.
 
-    Each token is folded to ASCII before the membership test, so ``Viale``,
-    ``viale`` and ``Località`` all match. Stripping stops at the first token that
-    is not a type word, which is the start of the actual street name. This runs
-    left to right so a bilingual ``Viale - Avenue`` prefix (two type words) is
-    removed in full.
+    Stops at the first non-type-word token. Runs left to right, so a bilingual
+    ``Viale - Avenue`` prefix (two type words) is removed in full.
     """
     start = 0
     for token in tokens:
@@ -154,20 +130,14 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
 def normalize_name(name: str) -> str:
     """Return the grouping key for a raw street ``name``.
 
-    Splits the name on whitespace and separator punctuation, strips leading
-    street-type words (Italian and French), then concatenates the remaining
-    tokens as lowercase ASCII letters and digits. Diacritics are folded and
-    spaces and punctuation are dropped, while digits are kept, so bilingual and
-    type-prefixed variants of one street collapse to the same value::
+    Strips leading street-type words, then concatenates the rest as lowercase
+    ASCII letters and digits (diacritics folded, separators dropped)::
 
         "Viale - Avenue Giuseppe Garibaldi" -> "giuseppegaribaldi"
-        "Viale Giuseppe Garibaldi"          -> "giuseppegaribaldi"
         "Corso / Avenue Père-Laurent"       -> "perelaurent"
 
-    If stripping the type words would leave nothing (the name was only a type
-    word, e.g. ``"Via"``), the key falls back to the ASCII letters of the whole
-    original name so distinct type-only names are not all merged into one empty
-    key.
+    If stripping leaves nothing (name was only a type word, e.g. ``"Via"``),
+    falls back to the whole name so type-only names don't all collapse to one key.
     """
     # Split on anything that is not a letter or digit so "Viale - Avenue" and
     # "Corso/Avenue" tokenize the same way regardless of the separator used.
@@ -181,13 +151,9 @@ def normalize_name(name: str) -> str:
 
 
 def first_word(name: str) -> str | None:
-    """Return the folded ASCII-letter form of a name's first word, or ``None``.
+    """Return the folded ASCII form of a name's first word, or ``None`` if none.
 
-    Splits ``name`` the same way :func:`normalize_name` does and folds the first
-    token to lowercase ASCII letters and digits (diacritics dropped). Returns
-    ``None`` when the name has no first token with letters or digits. This is the
-    candidate a caller compares against :data:`_PREFIXES` to discover street-type
-    words that are not yet stripped.
+    Used to discover street-type words not yet in :data:`_PREFIXES`.
     """
     for token in _split_tokens(name):
         letters = _letters_only(token)
@@ -197,21 +163,14 @@ def first_word(name: str) -> str | None:
 
 
 def is_known_prefix(word: str) -> bool:
-    """Return whether ``word`` is already a known street-type prefix.
-
-    ``word`` is expected to be the folded ASCII form produced by
-    :func:`first_word`; the comparison against :data:`_PREFIXES` is exact.
-    """
+    """Return whether ``word`` (folded ASCII) is a known street-type prefix."""
     return word in _PREFIXES
 
 
 def _split_tokens(name: str) -> list[str]:
     """Split ``name`` into tokens on any non-alphanumeric character.
 
-    Runs of separators (spaces, hyphens, slashes, dots) collapse so empty tokens
-    are never produced. Letters and digits within a token are preserved; the
-    prefix test folds each token to ASCII, and ``_letters_only`` keeps letters and
-    digits when building the key.
+    Runs of separators collapse, so empty tokens are never produced.
     """
     tokens: list[str] = []
     current: list[str] = []
@@ -229,10 +188,7 @@ def _split_tokens(name: str) -> list[str]:
 def _letters_only(token: str) -> str:
     """Return ``token`` folded to lowercase ASCII letters and digits.
 
-    Diacritics are folded (``é`` → ``e``) and every other character (spaces,
-    punctuation, separators) is dropped, but ASCII digits are kept: a house-number
-    or highway code such as ``A5`` or ``1°`` contributes ``a5`` / ``1`` to the key
-    so ``Via 4 Novembre`` and ``Via Novembre`` do not collapse together.
+    Digits are kept so ``Via 4 Novembre`` and ``Via Novembre`` stay distinct.
     """
     folded = _fold_ascii(token)
     return "".join(ch for ch in folded if "a" <= ch <= "z" or "0" <= ch <= "9")

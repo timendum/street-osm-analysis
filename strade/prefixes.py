@@ -1,15 +1,4 @@
-"""Scan an OSM dump for candidate street-type prefixes.
-
-Streams every named highway way from a dump, takes the *first word* of each
-name, folds it to lowercase ASCII letters, and tallies how often each word
-appears. Words already listed in :data:`strade.normalize._PREFIXES` are skipped,
-so the result is exactly the set of leading words the normalizer does *not* yet
-strip — the raw material for manually extending that list from real data.
-
-Output goes to stdout as ``count<tab>word`` lines sorted by descending count
-(ties broken alphabetically), keeping stdout scriptable while progress and
-warnings stay on stderr via the shared :class:`~strade.reporter.Reporter`.
-"""
+"""Scan a dump for candidate street-type prefixes to extend the normalizer."""
 
 from __future__ import annotations
 
@@ -31,14 +20,7 @@ def scan_first_words(
     fmt: SupportedFormat,
     reporter: Reporter,
 ) -> Counter[str]:
-    """Tally the first word of every named way, excluding known prefixes.
-
-    Streams the dump via :func:`~strade.parser.parse_highways`, and for each way
-    that carries a ``name`` takes its :func:`~strade.normalize.first_word`. Words
-    already recognized by :func:`~strade.normalize.is_known_prefix` are dropped;
-    the rest are counted. Unnamed ways and names with no alphabetic first word
-    contribute nothing.
-    """
+    """Count the first word of every named way, skipping already-known prefixes."""
     counts: Counter[str] = Counter()
     for way in parse_highways(path, fmt, reporter):
         if way.name is None:
@@ -51,10 +33,6 @@ def scan_first_words(
 
 
 def format_counts(counts: Counter[str]) -> str:
-    """Render ``counts`` as ``count<tab>word`` lines, most frequent first.
-
-    Ties on count are broken alphabetically by word so the output is stable
-    across runs. Returns the empty string when there are no candidates.
-    """
+    """Render the top counts as ``count<tab>word`` lines, most frequent first."""
     ordered = counts.most_common(50)
     return "\n".join(f"{count}\t{word}" for word, count in ordered)

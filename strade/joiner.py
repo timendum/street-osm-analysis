@@ -353,38 +353,14 @@ def find_candidate_pairs(
     projector: Projector,
     reporter: Reporter,
 ) -> list[CandidatePair]:
-    """Find *street* pairs in one group whose gap is in ``[threshold_m, 2*threshold_m)``.
+    """Find borderline street pairs whose gap is in ``[threshold_m, 2*threshold_m)``.
 
-    The group's ways are first joined into streets — the same connected
-    components :func:`join_group` produces at ``threshold_m`` — so the reported
-    unit is a whole street, not a raw fragment. Two distinct streets are reported
-    when the exact distance between their merged geometries is at least
-    ``threshold_m`` yet below ``2 * threshold_m``: these are the borderline pairs
-    a slightly larger threshold would collapse into one street, and their exact
-    ``distance_m`` is precisely the quantity that decides whether a bigger
-    threshold merges them.
+    Joins the group's ways into streets (as :func:`join_group` does), then
+    reports distinct street pairs a slightly larger threshold would merge. Uses
+    an ``STRtree`` to coarse-filter, then confirms the exact projected distance.
 
-    Working street-first (rather than the old way-first scan) means each near
-    pair is emitted once, with the true minimum street-to-street distance, and
-    ways already joined into the same street are never compared — they are one
-    unit. Each pair also carries the way and OSM node closest to the gap on each
-    side (see :class:`CandidatePair`) as debugging extras.
-
-    An ``STRtree`` over the merged street geometries coarse-filters the pairs to
-    those within ``2 * threshold_m``; every survivor is confirmed against the
-    exact projected distance. Streets with no projectable geometry (all members
-    degenerate) are dropped, since no distance can be measured to them.
-
-    Args:
-        group: The name group whose streets are compared.
-        threshold_m: The current Heuristic_Join threshold in meters. Pairs are
-            reported when ``threshold_m <= distance < 2 * threshold_m``.
-        projector: Projects ways to a metric CRS and measures distance in meters.
-        reporter: Receives a non-fatal warning for any pair whose distance cannot
-            be evaluated.
-
-    Returns:
-        The candidate street pairs, sorted by ascending distance.
+    Returns the candidate pairs sorted by ascending distance. ``reporter`` gets a
+    non-fatal warning for any pair whose distance cannot be measured.
     """
     ways = group.ways
     if len(ways) <= _SINGLE_WAY:
@@ -454,17 +430,11 @@ def print_candidate_pairs(
     stream: TextIO,
     header: bool = True,
 ) -> None:
-    """Write borderline candidate street pairs to ``stream`` as tab-separated rows.
+    """Write candidate pairs to ``stream`` as tab-separated rows.
 
-    Emits one row per pair with the columns
-    ``distance_m<TAB>street_id_a<TAB>street_id_b<TAB>way_id_a<TAB>way_id_b<TAB>``
-    ``node_id_a<TAB>node_id_b<TAB>norm_name<TAB>name``, in the order given (the
-    caller sorts them by ascending distance). The distance is rounded to two
-    decimals and a ``None`` node id is written as an empty field. When ``header``
-    is true a column header line is written first, so a caller streaming groups
-    can print the header only for the first non-empty batch. Written to
-    ``stream`` (standard output for the ``threshold`` command) so the pairs are
-    visible without opening the database.
+    Columns: ``distance_m``, ``way_id_a``, ``way_id_b``, ``norm_name``, ``name``,
+    with distance rounded to two decimals. Writes a header line first when
+    ``header`` is true, so a caller streaming batches emits it only once.
     """
     if header:
         stream.write(

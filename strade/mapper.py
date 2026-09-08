@@ -1,14 +1,9 @@
 """Density-normalized prominence map for a target street name.
 
-The ``map`` command shows where a given street name is proportionally most
-common, rather than a plain map of street density. Streets are binned into a
-square metric grid; :func:`build_grid` computes each cell's target share and
-:func:`render_map` colours it by that share relative to the whole-map average.
-
-This module holds only the pure aggregation (:func:`build_grid`) and matplotlib
-rendering (:func:`render_map`); reading streets is the store's job
-(:func:`strade.store.read_street_points`) and orchestration the CLI's
-(``run_map``), which keeps the aggregation free of I/O and directly testable.
+Bins streets into a square metric grid and colours each cell by how common the
+target name is there relative to the whole-map average. Holds only the pure
+aggregation (:func:`build_grid`) and matplotlib rendering (:func:`render_map`);
+the store reads streets and the CLI (``run_map``) orchestrates.
 """
 
 from __future__ import annotations
@@ -28,19 +23,14 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class GridCell:
-    """One populated square grid cell with its prominence ratio.
+    """One square grid cell with its prominence ratio.
 
-    ``x`` and ``y`` are the cell's lower-left corner in the projected metric CRS
-    (meters); the cell spans ``[x, x + cell_size)`` by ``[y, y + cell_size)``.
-    ``total`` is how many streets fell in the cell and ``matches`` how many of
-    those carried the target ``norm_name``; ``ratio`` is ``matches / total``, the
-    density-independent prominence plotted for the cell.
-
-    ``populated`` is ``True`` when the cell cleared the ``min_streets`` floor. A
-    cell below the floor is still kept (so it can be drawn as a distinct
-    "too-sparse-to-judge" colour rather than vanishing into the map background),
-    but it is excluded from the location-quotient statistics because a couple of
-    streets there would give a meaningless ratio.
+    ``x``/``y`` are the lower-left corner in the metric CRS (meters); the cell
+    spans ``[x, x + cell_size)`` by ``[y, y + cell_size)``. ``total`` streets fell
+    in the cell, ``matches`` of them carried the target ``norm_name``, and
+    ``ratio`` is ``matches / total``. ``populated`` is ``True`` when the cell
+    cleared the ``min_streets`` floor; below-floor cells are kept (drawn as a
+    distinct colour) but excluded from the location-quotient stats.
     """
 
     x: float
@@ -51,16 +41,11 @@ class GridCell:
     populated: bool
 
     def location_quotient(self, global_ratio: float) -> float:
-        """Return this cell's ratio relative to ``global_ratio`` (a location quotient).
+        """Return ``ratio / global_ratio`` (a location quotient).
 
-        ``ratio / global_ratio``: ``1.0`` means the target is exactly as common
-        here as across the mapped area, ``> 1`` locally over-represented, ``< 1``
-        under-represented. Dividing out the target's overall share is what lets a
-        ubiquitous name (present in nearly every cell) still reveal where it is
-        *disproportionately* common, instead of the map collapsing into a plain
-        map of where streets are. ``global_ratio`` of zero (the target matched
-        nothing) yields ``0.0`` so the map degrades gracefully rather than
-        dividing by zero.
+        ``1.0`` means the target is as common here as across the mapped area,
+        ``> 1`` over-represented, ``< 1`` under-represented. A ``global_ratio`` of
+        zero yields ``0.0`` to avoid dividing by zero.
         """
         if global_ratio == 0:
             return 0.0
@@ -69,21 +54,15 @@ class GridCell:
 
 @dataclass(frozen=True)
 class Grid:
-    """The full binned result: the cells to plot and the parameters that made them.
+    """The full binned result: cells to plot plus the parameters that made them.
 
-    ``cells`` holds every populated cell, each flagged ``populated`` by whether it
-    cleared the ``min_streets`` floor: cells above the floor are coloured by their
-    location quotient, cells below it are drawn in a distinct neutral colour so
-    "too few streets to judge" is visibly different from "low share". An empty
-    list means no street was placed at all. ``cell_size`` is the edge length in
-    meters and ``target`` the ``norm_name`` whose share each cell's ratio
-    measures; both are carried through for the plot title/labels.
-
-    ``global_ratio`` is the target's share across the cells that cleared the floor
-    (``sum(matches) / sum(total)`` over the ``populated`` cells), i.e. the
-    denominator each cell's location quotient is taken against, so a quotient of
-    ``1.0`` means "average among the cells that count". Sparse cells are excluded
-    from it so a stray match cannot skew the whole scale.
+    ``cells`` holds every cell that received a street (empty means none did);
+    each is flagged ``populated`` by whether it cleared ``min_streets``.
+    ``cell_size`` is the edge length in meters and ``target`` the ``norm_name``
+    each cell's ratio measures. ``global_ratio`` is the target's share across the
+    ``populated`` cells (``sum(matches) / sum(total)``), the denominator for each
+    cell's location quotient; sparse cells are excluded so a stray match cannot
+    skew the scale.
     """
 
     cells: list[GridCell]
@@ -106,29 +85,20 @@ def build_grid(
 ) -> Grid:
     """Bin street points into a square metric grid and compute per-cell prominence.
 
-    Each :class:`~strade.store.StreetPoint` is projected from WGS84 to the metric
-    CRS (via ``projector``, default :class:`~strade.geometry.Projector`) so cell
-    edges are a true distance in meters, then assigned to the cell
-    ``(floor(x / cell_size), floor(y / cell_size))``. For each cell the total and
-    target-matching street counts are tallied and turned into a ``matches /
-    total`` ratio.
+    Each point is projected to the metric CRS (via ``projector``, default
+    :class:`~strade.geometry.Projector`) and assigned to cell
+    ``(floor(x / cell_size), floor(y / cell_size))``, tallying total and
+    target-matching street counts into a ``matches / total`` ratio. Cells below
+    ``min_streets`` are kept but flagged ``populated=False`` and excluded from the
+    location-quotient stats (too few streets give a meaningless ratio).
 
-    Cells with fewer than ``min_streets`` streets are kept but flagged
-    ``populated=False``: with only a few streets a single match yields an
-    extreme, meaningless ratio, so they are excluded from the location-quotient
-    statistics and drawn in a distinct neutral colour by :func:`render_map`
-    instead of being coloured as if their ratio were trustworthy. ``target`` is
-    compared against each point's ``norm_name`` exactly, so it must be the
-    normalization key (as produced by ``join``), not a display name — this is
-    what makes bilingual/prefix variants count together.
+    ``target`` is matched against each point's ``norm_name`` exactly, so it must
+    be the normalization key from ``join`` (not a display name), which is what
+    makes bilingual/prefix variants count together. ``display_name`` is the plot
+    label shown in place of the key, defaulting to ``target``.
 
-    ``display_name`` is the human-readable label the plot shows in place of the
-    lossy ``target`` key (e.g. ``Via Roma`` for ``roma``); it defaults to
-    ``target`` when not supplied, since the aggregation itself only needs the key.
-
-    Streaming: ``points`` is consumed lazily and only the per-cell tallies are
-    retained, so this scales to a national database without holding every street
-    in memory. Returns a :class:`Grid`; its ``cells`` are unordered.
+    ``points`` is consumed lazily and only per-cell tallies are retained, so this
+    scales to a national database. Returns a :class:`Grid` with unordered cells.
     """
     if cell_size <= 0:
         raise ValueError("cell_size must be positive")
@@ -184,38 +154,18 @@ def build_grid(
 def render_map(grid: Grid, output_path: Path) -> None:
     """Render ``grid`` to an image file at ``output_path``.
 
-    Draws one filled square per populated cell, positioned at its projected
-    (x, y) corner. Cells are **coloured by their location quotient** — the cell's
-    target share divided by the target's share across the whole mapped area
-    (``grid.global_ratio``) — on a diverging colormap centred at ``1.0``: cells
-    below the area average read cool, cells above it read warm. Colouring by the
-    quotient rather than the raw share is what makes even a ubiquitous name show
-    where it is *disproportionately* common instead of the map collapsing into a
-    plain map of where streets are.
+    One filled square per cell at its projected (x, y) corner. ``populated``
+    cells are coloured by their location quotient on a diverging colormap centred
+    at ``1.0`` (below-average cool, above-average warm). The colorbar is
+    relabelled from quotient into absolute cell share (percent, ``quotient *
+    global_ratio``); title and colorbar use ``grid.display_name`` and the area
+    average is noted bottom-left.
 
-    The colorbar, however, is **labelled in absolute cell share** (percent), not
-    in quotient units: the tick at each quotient level is relabelled to the
-    share it corresponds to (``quotient * global_ratio``), so the legend is read
-    in the intuitive "X% of this cell's streets" terms while the colour still
-    encodes over/under-representation. The colorbar and title use
-    ``grid.display_name`` (the dominant human-readable name) rather than the lossy
-    key; the area-wide average that sits at the colormap centre is noted in the
-    plot's bottom-left corner.
-
-    Cells that did not clear the ``min_streets`` floor (``populated=False``) are
-    drawn in a hatched dark grey rather than coloured by a quotient, so a sparse
-    cell reads as "too few streets to judge" and is visibly distinct from a
-    genuinely low share (the cool end), an average share (the colormap's near
-    white centre), and an absent cell (blank background). The hatch and a darker
-    grey are deliberate: a plain light grey is too close to the near-white centre
-    of the diverging scale, so the texture and a labelled legend entry keep the
-    two apart. Sparse cells are omitted from the colorbar entirely.
-
-    The axes use an equal aspect ratio so the metric grid is not distorted, and
-    the footprint of the plotted cells traces the mapped area on its own — no
-    boundary/basemap input is required. The figure is saved (not shown), so the
-    command stays headless. Uses the non-interactive ``Agg`` backend, selected
-    before importing pyplot so rendering never depends on a display.
+    Below-floor cells (``populated=False``) are drawn in hatched dark grey and
+    omitted from the colorbar, so "too few streets to judge" stays distinct from
+    a low share, the average, and an absent cell. Axes use equal aspect; the
+    figure is saved (not shown) via the non-interactive ``Agg`` backend so the
+    command stays headless.
     """
     import matplotlib as mpl
 
@@ -227,13 +177,9 @@ def render_map(grid: Grid, output_path: Path) -> None:
 
     fig, ax = plt.subplots(figsize=(10, 12))
 
-    # Cells below the min_streets floor are drawn first, so they read as "too few
-    # streets to judge" rather than as a zero share (the low, blue end of the
-    # diverging scale) or as absent (blank background). A plain grey would clash
-    # with the diverging colormap's near-white centre (a quotient of 1.0, the
-    # area average), so these use a *darker* grey plus a hatch pattern — a texture
-    # no point on the smooth colour scale can have — and a labelled legend entry,
-    # to stay unmistakable. They carry no colormap value of their own.
+    # Below-floor cells drawn first in hatched dark grey (not a colormap value):
+    # a texture the smooth diverging scale can't have keeps "too few streets"
+    # distinct from a zero share, the near-white average centre, and absent cells.
     sparse = [cell for cell in grid.cells if not cell.populated]
     if sparse:
         sparse_squares = [
@@ -248,10 +194,7 @@ def render_map(grid: Grid, output_path: Path) -> None:
                 hatch="///",
             )
         )
-        # A proxy patch so the hatched grey is explicitly named in a legend,
-        # rather than left for the reader to infer from the map alone. The label
-        # is generic (no norm_name, no threshold count) — it only conveys that
-        # these cells lacked enough streets to score.
+        # Proxy patch so the hatched grey is named in the legend.
         sparse_key = Patch(
             facecolor="darkgrey",
             edgecolor="grey",
@@ -266,10 +209,8 @@ def render_map(grid: Grid, output_path: Path) -> None:
             Rectangle((cell.x, cell.y), grid.cell_size, grid.cell_size) for cell in scored
         ]
         quotients = [cell.location_quotient(grid.global_ratio) for cell in scored]
-        # Diverging scale centred on 1.0 (the area average): below reads cool,
-        # above warm. vmax is the largest observed quotient so the warm half
-        # spans the real over-representation; vmin pinned at 0 (a cell can be as
-        # low as zero share but never negative).
+        # Diverging scale centred on 1.0 (area average): vmax is the largest
+        # observed quotient, vmin pinned at 0 (share is never negative).
         vmax = max(max(quotients), 1.0 + 1e-9)
         norm = TwoSlopeNorm(vmin=0.0, vcenter=1.0, vmax=vmax)
         collection = PatchCollection(squares, cmap="YlOrBr", norm=norm)
@@ -330,25 +271,17 @@ def render_cities_map(
     display_name: str,
     projector: Projector | None = None,
 ) -> int:
-    """Render the ``cities`` result as a filled comune map to ``output_path``.
+    """Render the ``cities`` result as a filled comune choropleth to ``output_path``.
 
-    Draws every comune's boundary geometry, reprojected into the metric CRS (via
-    ``projector``, default :class:`~strade.geometry.Projector`) so the outlines
-    are undistorted, and fills each polygon by its match flag: a warm colour when
-    the comune contains at least one matching street/square, a cold colour when
-    it does not. This is the geometric counterpart to the CSV — a comune-level
-    choroplith of where the pattern was found — rather than the ``map`` command's
-    density-normalized street grid.
+    Fills each comune's boundary (reprojected to the metric CRS via ``projector``,
+    default :class:`~strade.geometry.Projector`) warm when it contains a matching
+    street/square, cold otherwise — the geometric counterpart to the CSV.
 
-    ``matches`` is consumed once; each :class:`~strade.cities.CityMatch` carries
-    the comune's raw WGS84 boundary (``match.area.geometry``) and its ``matched``
-    flag. A comune with an empty geometry is skipped. ``display_name`` labels the
-    plot (e.g. the pattern file's stem, or the searched name). Returns the number
-    of comuni drawn.
-
-    The figure is saved (not shown) with the non-interactive ``Agg`` backend,
-    selected before importing pyplot, so the command stays headless. A
-    ``MultiPolygon`` comune is drawn as each of its component polygons.
+    ``matches`` is consumed once; each :class:`~strade.cities.CityMatch` carries a
+    WGS84 boundary (``match.area.geometry``) and its ``matched`` flag. Comuni with
+    empty geometry are skipped and ``MultiPolygon`` comuni are drawn per part.
+    ``display_name`` labels the plot. Returns the number of comuni drawn. Saved
+    (not shown) via the ``Agg`` backend so the command stays headless.
     """
     import matplotlib as mpl
 

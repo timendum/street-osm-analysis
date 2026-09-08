@@ -14,6 +14,7 @@ import argparse
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from tqdm import tqdm
 
@@ -41,7 +42,11 @@ from strade.prefixes import format_counts, scan_first_words
 from strade.reporter import Reporter
 from strade.store import StreetWriter
 from strade.validation import InputError, validate_input
-from strade.writer import print_top_street_groups
+
+if TYPE_CHECKING:
+    from typing import TextIO
+
+    from strade.store import StreetGroup
 
 # Database extension appended to the derived default path.
 DB_SUFFIX = ".db"
@@ -62,6 +67,22 @@ DEFAULT_THRESHOLD_M = 100.0
 
 # Number of highest-count street groups printed to stdout after a join.
 TOP_STREET_GROUPS = 10
+
+# Field separator for the printed street-group summary rows.
+_FIELD_SEP = "\t"
+
+
+def print_top_street_groups(groups: list[StreetGroup], stream: TextIO) -> None:
+    """Write street groups to ``stream`` as tab-separated ``count/norm_name/name`` rows.
+
+    Groups are written in the order given (the caller sorts by descending count).
+    """
+    stream.write(f"count{_FIELD_SEP}norm_name{_FIELD_SEP}name\n")
+    stream.writelines(
+        f"{group.count}{_FIELD_SEP}{group.norm_name}{_FIELD_SEP}{group.name}\n"
+        for group in groups
+    )
+
 
 # Default square grid cell edge length for the `map` command, in kilometers.
 DEFAULT_CELL_KM = 10.0
