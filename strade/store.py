@@ -34,6 +34,8 @@ if TYPE_CHECKING:
     from pathlib import Path
     from typing import Self
 
+    from strade.patterns import Patterns
+
 # --- Schema -----------------------------------------------------------------
 
 # Each statement uses ``IF NOT EXISTS`` so opening an existing database is a
@@ -810,40 +812,56 @@ class MatchedWay:
     lat: float
 
 
-def read_ways_matching(db: Path, patterns: list[str]) -> Iterator[MatchedWay]:
-    """Stream one :class:`MatchedWay` per way whose ``name`` matches a pattern.
+def _matching_where(patterns: Patterns) -> tuple[str, list[str]]:
+    """Build the ``WHERE`` clause and bound params for a :class:`Patterns` match.
 
-    Builds a single ``WHERE name LIKE ? OR name LIKE ? ...`` query from
-    ``patterns`` (used verbatim as SQLite ``LIKE`` patterns, so ``%``/``_``
-    wildcards apply and matching is ASCII-case-insensitive) and streams the
-    matching rows, decoding each way's packed ``coords`` to recover its middle
-    resolved vertex as the representative point. The middle vertex is preferred
-    over an endpoint because a way's ends sit on the shared border with a
-    neighbour, so an endpoint can fall in the wrong comune; the midpoint lies
-    along the street's interior and lands in the comune the street actually runs
-    through. A matched way with no resolved coordinates is skipped, since it
-    cannot be placed inside any city.
+    Produces ``(name LIKE ? OR ...) [AND name NOT LIKE ? ...]``: the includes are
+    ORed (a name matches if it satisfies any), and each exclude is ANDed as a
+    ``NOT LIKE`` so a name matched by an include but also by any exclude is
+    dropped. The clause is built only from the fixed ``name LIKE ?`` /
+    ``name NOT LIKE ?`` templates; the pattern strings are returned separately as
+    bound parameters, never interpolated. ``includes`` must be non-empty.
+    """
+    if not patterns.includes:
+        raise ValueError("pattern matching requires at least one include (LIKE) pattern")
+    where = "(" + " OR ".join("name LIKE ?" for _ in patterns.includes) + ")"
+    params = list(patterns.includes)
+    for _ in patterns.excludes:
+        where += " AND name NOT LIKE ?"
+    params.extend(patterns.excludes)
+    return where, params
+
+
+def read_ways_matching(db: Path, patterns: Patterns) -> Iterator[MatchedWay]:
+    """Stream one :class:`MatchedWay` per way whose ``name`` matches the patterns.
+
+    Builds a single ``WHERE (name LIKE ? OR ...) AND name NOT LIKE ? ...`` query
+    from ``patterns`` (used verbatim as SQLite ``LIKE`` patterns, so ``%``/``_``
+    wildcards apply and matching is ASCII-case-insensitive): a name is kept when
+    it satisfies any include and none of the excludes. It streams the matching
+    rows, decoding each way's packed ``coords`` to recover its middle resolved
+    vertex as the representative point. The middle vertex is preferred over an
+    endpoint because a way's ends sit on the shared border with a neighbour, so
+    an endpoint can fall in the wrong comune; the midpoint lies along the
+    street's interior and lands in the comune the street actually runs through. A
+    matched way with no resolved coordinates is skipped, since it cannot be
+    placed inside any city.
 
     The string matching runs entirely in SQLite, so only the (typically few)
     ways that already matched a pattern are decoded and handed back for the more
-    expensive containment test. ``patterns`` must be non-empty; an empty list
-    would build an invalid query, and the ``cities`` command rejects an empty
-    pattern file before calling this.
+    expensive containment test. ``patterns.includes`` must be non-empty; an empty
+    list would build an invalid query, and the ``cities`` command rejects an
+    empty pattern file before calling this.
 
     Opens and closes its own connection over the iterator's lifetime, so callers
     should drive it to completion (or close it) to release the database handle.
     """
-    if not patterns:
-        raise ValueError("read_ways_matching requires at least one LIKE pattern")
-
-    where = " OR ".join("name LIKE ?" for _ in patterns)
+    where, params = _matching_where(patterns)
     conn = connect(db)
     try:
         cursor = conn.execute(
-            # `where` is built only from the fixed "name LIKE ?" template, one
-            # per pattern; the patterns themselves are bound parameters below.
             f"SELECT name, coords FROM ways WHERE {where}",
-            patterns,
+            params,
         )
         for name, coords_blob in cursor:
             coords = deserialize_coords_binary(coords_blob)
@@ -858,33 +876,29 @@ def read_ways_matching(db: Path, patterns: list[str]) -> Iterator[MatchedWay]:
         conn.close()
 
 
-def read_squares_matching(db: Path, patterns: list[str]) -> Iterator[MatchedWay]:
-    """Stream one :class:`MatchedWay` per square whose ``name`` matches a pattern.
+def read_squares_matching(db: Path, patterns: Patterns) -> Iterator[MatchedWay]:
+    """Stream one :class:`MatchedWay` per square whose ``name`` matches the patterns.
 
     The square counterpart of :func:`read_ways_matching`: it builds the same
-    ``WHERE name LIKE ? OR ...`` query from ``patterns`` and streams the matching
-    ``squares`` rows, yielding each as a :class:`MatchedWay` (name plus the
-    square's stored representative point) so the ``cities`` command can feed
-    squares through the very same :func:`~strade.cities.assign_matches` path used
-    for ways. A square already *is* a single point, so no coordinate decoding is
-    needed.
+    ``WHERE (name LIKE ? OR ...) AND name NOT LIKE ? ...`` query from ``patterns``
+    and streams the matching ``squares`` rows, yielding each as a
+    :class:`MatchedWay` (name plus the square's stored representative point) so
+    the ``cities`` command can feed squares through the very same
+    :func:`~strade.cities.assign_matches` path used for ways. A square already
+    *is* a single point, so no coordinate decoding is needed.
 
-    ``patterns`` must be non-empty (an empty list would build an invalid query);
-    the ``cities`` command rejects an empty pattern file before calling this.
-    Opens and closes its own connection over the iterator's lifetime, so callers
-    should drive it to completion (or close it) to release the database handle.
+    ``patterns.includes`` must be non-empty (an empty list would build an invalid
+    query); the ``cities`` command rejects an empty pattern file before calling
+    this. Opens and closes its own connection over the iterator's lifetime, so
+    callers should drive it to completion (or close it) to release the database
+    handle.
     """
-    if not patterns:
-        raise ValueError("read_squares_matching requires at least one LIKE pattern")
-
-    where = " OR ".join("name LIKE ?" for _ in patterns)
+    where, params = _matching_where(patterns)
     conn = connect(db)
     try:
         cursor = conn.execute(
-            # `where` is built only from the fixed "name LIKE ?" template, one
-            # per pattern; the patterns themselves are bound parameters below.
             f"SELECT name, lon, lat FROM squares WHERE {where}",
-            patterns,
+            params,
         )
         for name, lon, lat in cursor:
             yield MatchedWay(name=name, lon=lon, lat=lat)

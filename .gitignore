@@ -9,10 +9,4 @@ wheels/
 # Virtual environments
 .venv
 
-*.db
-*.db-wal
-*.db-shm
-*.osm
-*.osm.pbf
-*.png
-*.csv
+data

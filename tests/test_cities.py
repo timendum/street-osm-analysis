@@ -12,7 +12,7 @@ from shapely import Polygon
 from strade import store
 from strade.cities import CityIndex, assign_matches, build_city_index, write_csv
 from strade.models import CityArea, HighwayWay, NodeRef
-from strade.patterns import PatternError, parse_pattern_file
+from strade.patterns import PatternError, Patterns, parse_pattern_file
 from strade.reporter import Reporter
 from strade.store import MatchedWay
 
@@ -52,25 +52,49 @@ class ParsePatternFileTest(unittest.TestCase):
         self._write("%roma%\nvia garibaldi%\n%matteotti%\n")
         self.assertEqual(
             parse_pattern_file(self.path),
-            ["%roma%", "via garibaldi%", "%matteotti%"],
+            Patterns(includes=["%roma%", "via garibaldi%", "%matteotti%"]),
         )
 
     def test_comments_and_blank_lines_are_ignored(self) -> None:
         self._write("# streets named after Roma\n\n%roma%\n   # indented\n\n%mazzini%\n")
-        self.assertEqual(parse_pattern_file(self.path), ["%roma%", "%mazzini%"])
+        self.assertEqual(
+            parse_pattern_file(self.path), Patterns(includes=["%roma%", "%mazzini%"])
+        )
 
     def test_surrounding_whitespace_trimmed(self) -> None:
         self._write("   %roma%   \n")
-        self.assertEqual(parse_pattern_file(self.path), ["%roma%"])
+        self.assertEqual(parse_pattern_file(self.path), Patterns(includes=["%roma%"]))
 
     def test_duplicate_patterns_preserved(self) -> None:
         self._write("%roma%\n%roma%\n")
-        self.assertEqual(parse_pattern_file(self.path), ["%roma%", "%roma%"])
+        self.assertEqual(
+            parse_pattern_file(self.path), Patterns(includes=["%roma%", "%roma%"])
+        )
 
     def test_empty_file_raises(self) -> None:
         self._write("# only a comment\n\n")
         with self.assertRaises(PatternError):
             parse_pattern_file(self.path)
+
+    def test_minus_lines_become_excludes(self) -> None:
+        self._write("% Marconi\n- %di Sasso Marconi%\n-%Pasquale Marconi%\n")
+        self.assertEqual(
+            parse_pattern_file(self.path),
+            Patterns(
+                includes=["% Marconi"],
+                excludes=["%di Sasso Marconi%", "%Pasquale Marconi%"],
+            ),
+        )
+
+    def test_only_excludes_raises(self) -> None:
+        self._write("- %foo%\n")
+        with self.assertRaises(PatternError):
+            parse_pattern_file(self.path)
+
+    def test_bare_minus_line_is_dropped(self) -> None:
+        # A line that is only "-" (or "- ") has no pattern and is skipped.
+        self._write("%roma%\n-\n-   \n")
+        self.assertEqual(parse_pattern_file(self.path), Patterns(includes=["%roma%"]))
 
 
 class CityIndexTest(unittest.TestCase):
@@ -231,13 +255,31 @@ class ReadWaysMatchingTest(unittest.TestCase):
                     way_id=4, name="Via Roma senza punti", node_ids=[40], coords=[]
                 )
             )
+            # Two names ending in "Marconi": the first is the scientist (kept),
+            # the second a surname the exclude patterns must drop.
+            writer.append(
+                HighwayWay(
+                    way_id=5,
+                    name="Via Guglielmo Marconi",
+                    node_ids=[50],
+                    coords=[NodeRef(node_id=50, lon=8.0, lat=44.0)],
+                )
+            )
+            writer.append(
+                HighwayWay(
+                    way_id=6,
+                    name="Via Pasquale Marconi",
+                    node_ids=[60],
+                    coords=[NodeRef(node_id=60, lon=8.1, lat=44.1)],
+                )
+            )
         conn.close()
 
     def tearDown(self) -> None:
         self._dir.cleanup()
 
     def test_matches_like_pattern_case_insensitively(self) -> None:
-        ways = list(store.read_ways_matching(self.db, ["%roma%"]))
+        ways = list(store.read_ways_matching(self.db, Patterns(includes=["%roma%"])))
         names = sorted(w.name for w in ways)
         # "Via Roma" matches; "Via Roma senza punti" matches the LIKE but has no
         # coords so it is dropped.
@@ -246,21 +288,52 @@ class ReadWaysMatchingTest(unittest.TestCase):
     def test_middle_vertex_is_the_representative_point(self) -> None:
         # Via Roma has vertices [(7.32, 45.74), (7.33, 45.75)]; the middle index
         # (len // 2 == 1) picks the second vertex, avoiding the border-prone ends.
-        (way,) = store.read_ways_matching(self.db, ["Via Roma"])
+        (way,) = store.read_ways_matching(self.db, Patterns(includes=["Via Roma"]))
         self.assertAlmostEqual(way.lon, 7.33)
         self.assertAlmostEqual(way.lat, 45.75)
 
     def test_multiple_patterns_are_ored(self) -> None:
-        ways = list(store.read_ways_matching(self.db, ["%roma%", "%garibaldi%"]))
+        ways = list(
+            store.read_ways_matching(
+                self.db, Patterns(includes=["%roma%", "%garibaldi%"])
+            )
+        )
         names = sorted(w.name for w in ways)
         self.assertEqual(names, ["Via Roma", "Viale Giuseppe Garibaldi"])
 
     def test_no_match_yields_nothing(self) -> None:
-        self.assertEqual(list(store.read_ways_matching(self.db, ["%napoli%"])), [])
+        self.assertEqual(
+            list(store.read_ways_matching(self.db, Patterns(includes=["%napoli%"]))), []
+        )
+
+    def test_excludes_drop_matched_names(self) -> None:
+        # Both "…Marconi" names match the include; the exclude drops the surname,
+        # keeping only Guglielmo Marconi.
+        ways = list(
+            store.read_ways_matching(
+                self.db,
+                Patterns(includes=["%marconi%"], excludes=["%Pasquale Marconi%"]),
+            )
+        )
+        names = sorted(w.name for w in ways)
+        self.assertEqual(names, ["Via Guglielmo Marconi"])
+
+    def test_multiple_excludes_are_all_applied(self) -> None:
+        # Excluding both Marconi names leaves nothing.
+        ways = list(
+            store.read_ways_matching(
+                self.db,
+                Patterns(
+                    includes=["%marconi%"],
+                    excludes=["%Pasquale Marconi%", "%Guglielmo Marconi%"],
+                ),
+            )
+        )
+        self.assertEqual(ways, [])
 
     def test_empty_patterns_raises(self) -> None:
         with self.assertRaises(ValueError):
-            list(store.read_ways_matching(self.db, []))
+            list(store.read_ways_matching(self.db, Patterns(includes=[])))
 
 
 if __name__ == "__main__":
