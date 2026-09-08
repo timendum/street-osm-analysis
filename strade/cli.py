@@ -1086,7 +1086,8 @@ def run_cities(options: CitiesOptions, reporter: Reporter) -> int:
         return reporter.exit_code or 1
 
     reporter.progress(
-        f"cities: matching {len(patterns)} pattern(s) against streets in comuni"
+        f"cities: matching {len(patterns.includes)} include pattern(s) "
+        f"({len(patterns.excludes)} exclude(s)) against streets in comuni"
     )
 
     # Pass 1: read the dump's admin boundaries (comuni plus parent levels), then
@@ -1117,7 +1118,7 @@ def run_cities(options: CitiesOptions, reporter: Reporter) -> int:
 
     output_path = default_cities_output_path(options.database_path, options.pattern_path)
     with output_path.open("w", encoding="utf-8", newline="") as stream:
-        rows = write_csv(index.matches, stream)
+        rows = write_csv(index.matches, stream, options.region_id)
 
     hit = sum(1 for match in index.matches if match.matched)
     reporter.progress(

@@ -226,7 +226,7 @@ def _cell(value: str | None) -> str:
     return "" if value is None else value
 
 
-def write_csv(matches: Iterable[CityMatch], stream: TextIO) -> int:
+def write_csv(matches: Iterable[CityMatch], stream: TextIO, region_id: int | None) -> int:
     """Write one CSV row per comune to ``stream`` and return the rows written.
 
     Emits :data:`CSV_HEADER` first, then one row per :class:`CityMatch` in the
@@ -252,4 +252,15 @@ def write_csv(matches: Iterable[CityMatch], stream: TextIO) -> int:
             )
         )
         rows += 1
+    writer.writerow(
+        (
+            "Total",
+            "",
+            "",
+            "",
+            "",
+            str(region_id) if region_id else "",
+            sum(1 for m in matches if m.matched),
+        )
+    )
     return rows

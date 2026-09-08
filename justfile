@@ -30,7 +30,7 @@ top DB LIMIT="20":
   sqlite3 -box "{{DB}}" "SELECT count, norm_name, name FROM street_groups ORDER BY count DESC, norm_name ASC LIMIT {{LIMIT}};"
 
 qname DB QUERY:
-  sqlite3 -box "{{DB}}" "SELECT count, norm_name, name FROM street_groups WHERE norm_name like '{{QUERY}}' ORDER BY count DESC, norm_name ASC;"
+  sqlite3 -box "{{DB}}" "SELECT count, norm_name, name FROM street_groups WHERE name like '{{QUERY}}' ORDER BY count DESC, norm_name ASC;"
 
 # run tests
 test *ARGS:
