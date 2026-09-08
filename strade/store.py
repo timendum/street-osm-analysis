@@ -9,6 +9,8 @@ all pipeline state in one SQLite database with these tables:
 - ``street_groups`` — one row per norm_name: count of distinct streets sharing it.
 - ``done``    — the set of street names whose streets are fully committed.
 - ``squares`` — one row per named ``place=square`` point, read by ``cities``.
+- ``areas``   — one row per administrative boundary (comune + parent levels),
+  populated by ``areas`` and read by ``cities`` for point-in-polygon tests.
 
 Way geometry is stored in two BLOB columns (``node_ids`` and ``coords``) using a
 compact binary encoding; ``name`` is TEXT and each row carries the ``norm_name``
@@ -26,7 +28,9 @@ import zlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from strade.models import HighwayWay, NameGroup, NodeRef, Square, Street
+import shapely
+
+from strade.models import CityArea, HighwayWay, NameGroup, NodeRef, Square, Street
 from strade.normalize import normalize_name
 
 if TYPE_CHECKING:
@@ -94,6 +98,32 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     # The `cities` command matches squares by name with SQLite LIKE, so an index
     # on name serves the same role as ways_by_norm_name does for ways.
     "CREATE INDEX IF NOT EXISTS squares_by_name ON squares (name)",
+    # One row per administrative boundary the `cities` command reads (comune
+    # admin_level=8 plus the parent region/country levels 2/4). Persisting them
+    # here lets `cities` skip the full-dump area-builder pass and read the
+    # already-assembled boundaries from the database instead; the `areas` command
+    # populates the table. ``geometry`` holds the boundary as WKB (a
+    # Polygon/MultiPolygon in raw WGS84 lon/lat), the lossless round-trip of the
+    # shapely geometry the parser assembles. ``from_way`` is stored as 0/1 (SQLite
+    # has no boolean) and, with ``osm_id``, reconstructs the source OSM reference.
+    # ``osm_id`` is not unique across OSM's separate way/relation id spaces, so
+    # rows are keyed by an autoincrement id, mirroring ``squares``.
+    (
+        "CREATE TABLE IF NOT EXISTS areas ("
+        "area_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "osm_id INTEGER NOT NULL, "
+        "from_way INTEGER NOT NULL, "
+        "admin_level TEXT, "
+        "name TEXT, "
+        "postal_code TEXT, "
+        "istat TEXT, "
+        "catasto TEXT, "
+        "wikidata TEXT, "
+        "geometry BLOB NOT NULL)"
+    ),
+    # `cities` splits the stored boundaries by admin_level (comuni vs. the coarser
+    # parents), so an index on admin_level serves that partitioning read.
+    "CREATE INDEX IF NOT EXISTS areas_by_admin_level ON areas (admin_level)",
 )
 
 
@@ -480,6 +510,168 @@ def clear_squares(conn: sqlite3.Connection) -> None:
     """
     with conn:
         conn.execute("DELETE FROM squares")
+
+
+# --- Areas side: boundary writer and reader ---------------------------------
+
+
+class AreaWriter:
+    """Insert administrative boundaries into the ``areas`` table.
+
+    Mirrors :class:`SquareWriter`'s batching: each :meth:`append` buffers one row
+    and rows are flushed to SQLite in transactions of at most ``batch_size``.
+    Boundaries carry no resume bookkeeping — a few thousand polygons assemble
+    quickly, so the whole set is re-read on every ``areas`` run — so the caller
+    clears the table once up front (:func:`clear_areas`) and then appends the
+    whole set. Each boundary's shapely geometry is stored as WKB (the lossless
+    round-trip of the assembled polygon) and ``from_way`` as 0/1. ``close``
+    flushes any trailing partial batch, so callers must ``close`` (or use the
+    writer as a context manager).
+    """
+
+    def __init__(self, conn: sqlite3.Connection, batch_size: int = 1000) -> None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        self._conn = conn
+        self._batch_size = batch_size
+        # Buffered (osm_id, from_way, admin_level, name, postal_code, istat,
+        # catasto, wikidata, geometry_wkb) rows awaiting flush.
+        self._pending: list[
+            tuple[
+                int,
+                int,
+                str | None,
+                str | None,
+                str | None,
+                str | None,
+                str | None,
+                str | None,
+                bytes,
+            ]
+        ] = []
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def append(self, area: CityArea) -> None:
+        """Buffer ``area`` for insertion, flushing once the batch is full.
+
+        The boundary geometry is encoded to WKB here; ``from_way`` is stored as
+        ``1`` for a way-sourced boundary and ``0`` for a relation-sourced one so
+        the source OSM reference can be reconstructed on read.
+        """
+        self._pending.append(
+            (
+                area.osm_id,
+                1 if area.from_way else 0,
+                area.admin_level,
+                area.name,
+                area.postal_code,
+                area.istat,
+                area.catasto,
+                area.wikidata,
+                shapely.to_wkb(area.geometry),
+            )
+        )
+        if len(self._pending) >= self._batch_size:
+            self._flush()
+
+    def close(self) -> None:
+        """Flush any buffered areas so a trailing partial batch is persisted."""
+        self._flush()
+
+    def _flush(self) -> None:
+        """Commit the buffered rows in one transaction and clear the buffer."""
+        if not self._pending:
+            return
+        pending = self._pending
+        self._pending = []
+        with self._conn:
+            self._conn.executemany(
+                "INSERT INTO areas "
+                "(osm_id, from_way, admin_level, name, postal_code, istat, "
+                "catasto, wikidata, geometry) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                pending,
+            )
+
+
+def clear_areas(conn: sqlite3.Connection) -> None:
+    """Empty the ``areas`` table so a fresh ``areas`` run repopulates it cleanly.
+
+    Boundaries carry no resume bookkeeping (the whole set is re-read each run), so
+    the ``areas`` command clears the table before repopulating it to avoid
+    accumulating duplicate rows across runs. Runs in its own transaction.
+    """
+    with conn:
+        conn.execute("DELETE FROM areas")
+
+
+def count_areas(db: Path) -> int:
+    """Return the number of rows in the ``areas`` table of ``db``.
+
+    A cheap ``COUNT(*)`` the ``cities`` command uses to tell an unpopulated
+    ``areas`` table (``areas`` never run) apart from a genuinely empty dump, so it
+    can direct the user to run ``areas`` first. Opens and closes its own
+    connection.
+    """
+    conn = connect(db)
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM areas").fetchone()
+        return int(row[0]) if row is not None else 0
+    finally:
+        conn.close()
+
+
+def read_areas(db: Path) -> Iterator[CityArea]:
+    """Stream one :class:`CityArea` per stored administrative boundary in ``db``.
+
+    The persisted counterpart of :func:`~strade.parser.parse_admin_areas`: it
+    reads the ``areas`` table (populated by the ``areas`` command) and rebuilds
+    each row into a :class:`~strade.models.CityArea`, decoding the WKB
+    ``geometry`` back to a shapely polygon and ``from_way`` back to a bool. Rows
+    are yielded in insertion order (``area_id``), which preserves the dump read
+    order the ``cities`` CSV is expected to follow.
+
+    Every admin level stored is yielded (comuni plus the parent 2/4 levels);
+    :func:`~strade.cities.select_comuni` splits them, so this deliberately does
+    not filter by level. Opens and closes its own connection over the iterator's
+    lifetime, so callers should drive it to completion (or close it) to release
+    the database handle.
+    """
+    conn = connect(db)
+    try:
+        cursor = conn.execute(
+            "SELECT osm_id, from_way, admin_level, name, postal_code, istat, "
+            "catasto, wikidata, geometry FROM areas ORDER BY area_id"
+        )
+        for (
+            osm_id,
+            from_way,
+            admin_level,
+            name,
+            postal_code,
+            istat,
+            catasto,
+            wikidata,
+            geometry_wkb,
+        ) in cursor:
+            yield CityArea(
+                name=name,
+                postal_code=postal_code,
+                istat=istat,
+                catasto=catasto,
+                wikidata=wikidata,
+                osm_id=int(osm_id),
+                from_way=bool(from_way),
+                geometry=shapely.from_wkb(bytes(geometry_wkb)),
+                admin_level=admin_level,
+            )
+    finally:
+        conn.close()
 
 
 # --- Join side: header, grouped read, and done-set -------------------------

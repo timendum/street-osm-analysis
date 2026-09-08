@@ -120,6 +120,23 @@ class ExtractOptions:
 
 
 @dataclass(frozen=True)
+class AreasOptions:
+    """Resolved options for the ``areas`` command.
+
+    Reads the administrative boundaries (comune ``admin_level=8`` plus the parent
+    region/country levels the ``cities`` region filter needs) from the OSM dump
+    and stores them in the ``areas`` table so ``cities`` can skip re-parsing the
+    dump on every run. Like ``extract`` the ``database_path`` is always concrete:
+    it defaults to the dump path with a ``.db`` extension when the optional
+    ``database`` positional is omitted.
+    """
+
+    input_path: Path  # OSM dump
+    database_path: Path  # SQLite checkpoint to write the boundaries into
+    verbosity: int  # reporter verbosity level (incremented per -v)
+
+
+@dataclass(frozen=True)
 class JoinOptions:
     """Resolved options for the ``join`` command.
 
@@ -207,18 +224,15 @@ class AliasOptions:
 class CitiesOptions:
     """Resolved options for the ``cities`` command.
 
-    Reads ``admin_level=8`` comune boundaries from the OSM dump and the named
-    ways from the ``extract`` database, then reports (as a CSV file named
+    Reads ``admin_level=8`` comune boundaries (stored by ``areas``) and the named
+    ways/squares from the database, then reports (as a CSV file named
     ``<database>-<pattern_file>.csv`` beside the database) for each comune
     whether it contains at least one street whose name matches a ``LIKE``
-    pattern from ``pattern_path``. ``database_path`` defaults to the
-    dump path with a ``.db`` extension (like ``extract``) when the optional
-    ``database`` positional is omitted; the pattern file has no default and must
-    be supplied.
+    pattern from ``pattern_path``. The database is the main positional; the
+    pattern file has no default and must be supplied.
     """
 
-    input_path: Path  # OSM dump, read for comune boundaries
-    database_path: Path  # SQLite checkpoint produced by `extract`, read for ways
+    database_path: Path  # SQLite checkpoint: ways, squares, and comune boundaries
     pattern_path: Path  # file of SQLite LIKE patterns, one per line
     region_id: int | None  # parent admin boundary (region/country) to clip to, or None
     map_path: Path | None  # image to render the comune choropleth to, or None to skip
@@ -341,6 +355,41 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     extract.add_argument(
+        "-d",
+        "--database",
+        dest="database_opt",
+        type=Path,
+        default=None,
+        help="Path to the SQLite checkpoint to write (overrides the default).",
+    )
+
+    # areas: parse the dump's admin boundaries into the areas table for `cities`.
+    areas = subparsers.add_parser(
+        "areas",
+        parents=[common],
+        help=(
+            "Parse the dump's administrative boundaries (comune plus parent "
+            "region/country levels) into the areas table."
+        ),
+    )
+    areas.add_argument(
+        "input",
+        type=Path,
+        help="Path to the OSM dump to read boundaries from (.osm.pbf, .osm, ...).",
+    )
+    # Same database resolution as `extract`: optional positional or -d/--database,
+    # defaulting to the dump path with a .db extension.
+    areas.add_argument(
+        "database",
+        type=Path,
+        nargs="?",
+        default=None,
+        help=(
+            "Path to the SQLite checkpoint to write. "
+            "Defaults to the dump path with a .db extension."
+        ),
+    )
+    areas.add_argument(
         "-d",
         "--database",
         dest="database_opt",
@@ -496,33 +545,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "cities",
         parents=[common],
         help=(
-            "For every admin_level=8 comune boundary in the dump, report "
+            "For every admin_level=8 comune boundary stored by `areas`, report "
             "whether it contains at least one street whose name matches a LIKE "
             "pattern from the pattern file, written to a "
             "<database>-<pattern_file>.csv file beside the database."
         ),
     )
     cities.add_argument(
-        "input",
+        "database",
         type=Path,
-        help="Path to the OSM dump to read comune boundaries from (.osm.pbf, ...).",
+        help=(
+            "Path to the SQLite checkpoint produced by `extract` and `areas` "
+            "(read for the ways, squares, and comune boundaries)."
+        ),
     )
     cities.add_argument(
         "patterns",
         type=Path,
         help="Path to a file of SQLite LIKE patterns, one per line (# comments allowed).",
-    )
-    # Optional and last so the two-argument form (dump + patterns) resolves the
-    # database from the dump path without ambiguity.
-    cities.add_argument(
-        "database",
-        type=Path,
-        nargs="?",
-        default=None,
-        help=(
-            "Path to the SQLite checkpoint produced by `extract` (read for the "
-            "ways). Defaults to the dump path with a .db extension."
-        ),
     )
     cities.add_argument(
         "-r",
@@ -562,6 +602,7 @@ def parse_args(
     argv: list[str],
 ) -> (
     ExtractOptions
+    | AreasOptions
     | JoinOptions
     | ThresholdOptions
     | PrefixesOptions
@@ -596,6 +637,18 @@ def parse_args(
             verbosity=args.verbosity,
         )
 
+    if args.command == "areas":
+        # Same database resolution as `extract`: -d/--database wins over the
+        # optional positional; either overrides the derived default.
+        database = args.database_opt or args.database
+        if database is None:
+            database = default_database_path(args.input)
+        return AreasOptions(
+            input_path=args.input,
+            database_path=database,
+            verbosity=args.verbosity,
+        )
+
     if args.command == "prefixes":
         return PrefixesOptions(input_path=args.input, verbosity=args.verbosity)
 
@@ -619,11 +672,9 @@ def parse_args(
         )
 
     if args.command == "cities":
-        # The optional database positional overrides the default derived from the
-        # dump path (as in `extract`).
+        # The database is now the main positional (boundaries, ways, and squares
+        # all come from it); the dump is no longer read by `cities`.
         database = args.database
-        if database is None:
-            database = default_database_path(args.input)
         # Resolve the optional map path: absent -> None (no map); given without a
         # value -> the sentinel, replaced by the CSV-adjacent default; given a
         # value -> that path.
@@ -631,7 +682,6 @@ def parse_args(
         if map_path is _MAP_DEFAULT_PATH:
             map_path = default_cities_map_path(database, args.patterns)
         return CitiesOptions(
-            input_path=args.input,
             database_path=database,
             pattern_path=args.patterns,
             region_id=args.region,
@@ -724,6 +774,52 @@ def run_extract(options: ExtractOptions, reporter: Reporter) -> int:
     header = store.read_header(options.database_path)
     reporter.set_counts(parsed=counts.parsed_count, groups=header.group_count)
     reporter.summary()
+
+    # 0 when no non-fatal warnings were recorded, else non-zero.
+    return reporter.exit_code
+
+
+def run_areas(options: AreasOptions, reporter: Reporter) -> int:
+    """Run the ``areas`` command; returns the process exit code.
+
+    Validates the input dump, opens the database, and streams the dump's
+    administrative boundaries (comune ``admin_level=8`` plus the parent
+    region/country levels the ``cities`` region filter needs) from
+    :func:`~strade.parser.parse_admin_areas` into an
+    :class:`~strade.store.AreaWriter`, storing each assembled boundary in the
+    ``areas`` table. The ``cities`` command then reads these rows instead of
+    re-parsing the dump, so a dump queried repeatedly pays the area-builder pass
+    once here rather than on every ``cities`` run.
+
+    Boundaries carry no resume bookkeeping — a few thousand polygons assemble
+    quickly — so the table is cleared and repopulated in full on every run.
+
+    A fatal input error (missing file, unsupported format) is reported via the
+    Reporter and mapped to a non-zero exit code. On success the boundary count is
+    reported and the run terminates with ``0`` when no non-fatal warnings were
+    recorded, else a non-zero code.
+    """
+    try:
+        fmt = validate_input(options.input_path)
+    except InputError as exc:
+        # Fatal input error: report it and terminate non-zero.
+        reporter.warn(str(exc))
+        return reporter.exit_code or 1
+
+    conn = store.connect(options.database_path)
+    try:
+        # No resume bookkeeping: clear the table and repopulate it in full so a
+        # re-run against a populated database does not accumulate duplicate rows.
+        store.clear_areas(conn)
+        area_count = 0
+        with store.AreaWriter(conn) as area_writer:
+            for area in parse_admin_areas(options.input_path, fmt, reporter):
+                area_writer.append(area)
+                area_count += 1
+    finally:
+        conn.close()
+
+    reporter.progress(f"areas: wrote {area_count} administrative boundary(ies)")
 
     # 0 when no non-fatal warnings were recorded, else non-zero.
     return reporter.exit_code
@@ -1042,12 +1138,15 @@ def run_alias(options: AliasOptions, reporter: Reporter) -> int:
 def run_cities(options: CitiesOptions, reporter: Reporter) -> int:
     """Run the ``cities`` command; returns the process exit code.
 
-    Validates the OSM dump, then reads the LIKE-pattern file (a file with no
-    usable pattern is a fatal error). It reads the dump's administrative
-    boundaries and, when ``--region`` names a parent boundary, drops comuni that
-    spilled into the dump from across that region's border
-    (:func:`~strade.cities.select_comuni`); a region id absent from the dump is a
-    fatal error. The kept comuni go into a :class:`~strade.cities.CityIndex` (a
+    Checks the database exists (a missing database is a fatal error directing the
+    user to run ``extract`` first), then reads the LIKE-pattern file (a file with
+    no usable pattern is a fatal error). It reads the administrative boundaries the
+    ``areas`` command stored in the database and, when ``--region`` names a
+    parent boundary, drops comuni that spilled into the extract from across that
+    region's border (:func:`~strade.cities.select_comuni`); a region id absent
+    from the stored boundaries is a fatal error, and an ``areas`` table never
+    populated (run ``areas`` first) is likewise fatal. The kept comuni go into a
+    :class:`~strade.cities.CityIndex` (a
     spatial index for point-in-polygon lookup), then it streams only the ways
     whose name matches a pattern from the ``extract`` database
     (:func:`~strade.store.read_ways_matching`) and flags the comune each matching
@@ -1061,18 +1160,11 @@ def run_cities(options: CitiesOptions, reporter: Reporter) -> int:
     ``true``/``false`` ``matched`` column — keeping all progress and warnings on
     stderr via the reporter.
 
-    A fatal input error (missing/unsupported dump, missing database, or an empty
-    pattern file) is reported via the reporter and mapped to a non-zero exit
-    code. On success the run terminates with ``0`` when no non-fatal warnings
-    were recorded, else a non-zero code.
+    A fatal input error (missing database, an unpopulated ``areas`` table, or an
+    empty pattern file) is reported via the reporter and mapped to a non-zero
+    exit code. On success the run terminates
+    with ``0`` when no non-fatal warnings were recorded, else a non-zero code.
     """
-    try:
-        fmt = validate_input(options.input_path)
-    except InputError as exc:
-        # Fatal input error: report it and terminate non-zero.
-        reporter.warn(str(exc))
-        return reporter.exit_code or 1
-
     if not options.database_path.is_file():
         reporter.warn(
             f"database not found: {options.database_path} (run `extract` first)"
@@ -1090,11 +1182,20 @@ def run_cities(options: CitiesOptions, reporter: Reporter) -> int:
         f"({len(patterns.excludes)} exclude(s)) against streets in comuni"
     )
 
-    # Pass 1: read the dump's admin boundaries (comuni plus parent levels), then
-    # optionally clip to a region before building the comune spatial index.
+    # Pass 1: read the admin boundaries (comuni plus parent levels) the `areas`
+    # command stored in the database, then optionally clip to a region before
+    # building the comune spatial index. Reading them from the database instead
+    # of re-parsing the dump is the whole point of the `areas` command: a dump
+    # queried repeatedly pays the area-builder pass once, in `areas`, not here.
+    if store.count_areas(options.database_path) == 0:
+        reporter.warn(
+            f"no administrative boundaries stored in {options.database_path} "
+            "(run `areas` first)"
+        )
+        return reporter.exit_code or 1
     try:
         comuni = select_comuni(
-            parse_admin_areas(options.input_path, fmt, reporter),
+            store.read_areas(options.database_path),
             options.region_id,
             reporter,
         )
@@ -1148,17 +1249,20 @@ def main(argv: list[str] | None = None) -> int:
 
     Parses ``argv`` (defaulting to ``sys.argv[1:]``) into resolved options,
     constructs a :class:`~strade.reporter.Reporter`, and dispatches to
-    :func:`run_extract` for :class:`ExtractOptions`, :func:`run_join` for
-    :class:`JoinOptions`, :func:`run_threshold` for :class:`ThresholdOptions`,
-    :func:`run_prefixes` for :class:`PrefixesOptions`, :func:`run_map` for
-    :class:`MapOptions`, or :func:`run_alias` for :class:`AliasOptions`.
-    Returns the command's process exit code.
+    :func:`run_extract` for :class:`ExtractOptions`, :func:`run_areas` for
+    :class:`AreasOptions`, :func:`run_join` for :class:`JoinOptions`,
+    :func:`run_threshold` for :class:`ThresholdOptions`, :func:`run_prefixes` for
+    :class:`PrefixesOptions`, :func:`run_map` for :class:`MapOptions`,
+    :func:`run_alias` for :class:`AliasOptions`, or :func:`run_cities` for
+    :class:`CitiesOptions`. Returns the command's process exit code.
     """
     try:
         options = parse_args(sys.argv[1:] if argv is None else argv)
         reporter = Reporter(verbosity=options.verbosity)
         if isinstance(options, ExtractOptions):
             return run_extract(options, reporter)
+        if isinstance(options, AreasOptions):
+            return run_areas(options, reporter)
         if isinstance(options, PrefixesOptions):
             return run_prefixes(options, reporter)
         if isinstance(options, ThresholdOptions):

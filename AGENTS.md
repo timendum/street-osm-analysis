@@ -26,6 +26,15 @@ an optional positional argument.
   > **Resumable**: tracks per-group done-markers so a long run survives an
   > interruption.
 
+- **`areas`** (runs before `cities`) — stream-parse the dump's administrative
+  boundaries (comune `admin_level=8` plus the parent region `4` / country `2`
+  levels the `cities` region filter needs) and store each assembled boundary,
+  geometry included, in an `areas` table. This lets `cities` read the
+  already-assembled boundaries from the database instead of re-running the
+  pyosmium area-builder pass on every run — a win when one dump is queried by
+  `cities` repeatedly. Not resumable: a few thousand polygons assemble quickly,
+  so the table is cleared and repopulated in full on every run.
+
 - **`prefixes`** (helper) — scans a dump for candidate street-type words to
   extend the normalizer's prefix list.
 
@@ -45,12 +54,13 @@ an optional positional argument.
   `streets` table to its canonical key and rebuilds `street_groups`. The file
   defaults to `aliases.txt` beside the database (`-a` overrides).
 
-- **`cities`** (runs after `extract`) — flags, for every `admin_level=8`
-  comune, whether it contains at least one street or square whose name matches a
-  file of SQLite `LIKE` patterns, via a point-in-polygon test against the comune
-  boundaries read from the dump. Writes one CSV row per comune
-  to a `<database>-<pattern_file>.csv` file beside the database.  
-  An optional `-r/--region <osm_relation_id>` clips the report to a parent boundary (country `admin_level=2` / region `4`), dropping comuni that spill in from across the extract's cut; the hierarchy is hardcoded for Italy.
+- **`cities`** (runs after `extract` and `areas`) — flags, for every
+  comune, whether it contains at least one street or square whose
+  name matches a file of SQLite `LIKE` patterns, via a point-in-polygon test
+  against the comune boundaries. The boundaries are read from the `areas` table
+  in the database (populated by the `areas` command). Writes one CSV row per comune to a
+  `<database>-<pattern_file>.csv` file beside the database.  
+  An optional `-r/--region <osm_relation_id>` clips the report to a parent boundary (country `admin_level=2` / region `4`), dropping comuni that spill in from across the extract's cut; the hierarchy is hardcoded for Italy. 
 
 ### Technical decisions
 
@@ -71,17 +81,19 @@ If a edit change something written here, ask the user if he wants to update AGEN
   - `parse_highways` yields a `HighwayWay` per `highway`-tagged way, resolving
   node coordinates in one pass and supporting resume via a way-id cursor.
   - `parse_admin_areas` yields a `CityArea` per administrative boundary at the
-  levels `cities` reads (comune `8` plus parent `2`/`4`).
+  levels the `areas` command stores for `cities` (comune `8` plus parent `2`/`4`).
   - `parse_squares` yields a `Square` per named `place=square` element, reduced
   to a representative point.
 - `collector.py` — routes named ways to storage and counts unnamed ones during
   the extract pass. Grouping is deliberately deferred to the join side.
 - `store.py` — the SQLite checkpoint layer both stages hand off through: schema,
   WAL connection, way/coord (de)serialization, and the writer/reader helpers for
-  ways, joined streets and squares. Owns the resume markers (extract's way-id
-  cursor via header/count metadata, join's per-group `DoneSet`) and the reads
-  the later commands query (`read_groups` in normalization-key order, street
-  points, alias relabeling, `*_matching` pattern lookups).
+  ways, joined streets, squares and admin boundaries (`areas`). Owns the resume
+  markers (extract's way-id cursor via header/count metadata, join's per-group
+  `DoneSet`) and the reads the later commands query (`read_groups` in
+  normalization-key order, street points, alias relabeling, `*_matching` pattern
+  lookups, and `read_areas` for the stored comune/parent boundaries the `cities`
+  command tests against — geometry stored as WKB via `AreaWriter`).
 - `normalize.py` — derives the language/type-agnostic grouping key: strips
   street-type prefixes (Italian + French) and folds to lowercase ASCII
   letters/digits, so bilingual and prefix variants collapse to one key.
