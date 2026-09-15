@@ -47,9 +47,13 @@ _BOUNDARY_TAG = ("boundary", "administrative")
 # so the cities aggregation can tell comuni apart from the coarser parent levels
 # read in the same pass.
 COMUNE_ADMIN_LEVEL = "8"
+# The region admin_level (Italy's admin_level=4). Public so the `kpi` command's
+# region-concentration measure can pick the region boundaries out of the stored
+# areas without hard-coding the literal.
+REGION_ADMIN_LEVEL = "4"
 # Country and region are the parent levels read alongside the comune so the
 # `cities` region filter can find a parent boundary by id.
-PARENT_ADMIN_LEVELS = ("2", "4")
+PARENT_ADMIN_LEVELS = ("2", REGION_ADMIN_LEVEL)
 _ADMIN_LEVELS = (*PARENT_ADMIN_LEVELS, COMUNE_ADMIN_LEVEL)
 _ADMIN_LEVEL_TAGS = tuple(("admin_level", level) for level in _ADMIN_LEVELS)
 _ADMIN_LEVEL_SET = frozenset(_ADMIN_LEVELS)

@@ -48,6 +48,15 @@ an optional positional argument.
   normalized against street density rather than being a plain density/population
   map.
 
+- **`kpi`** (runs after `join`) — scores how geographically spread out each
+  `norm_name` is. For every name carried by more than `-n/--min-count` streets
+  (default 20), computes distribution KPIs: standard distance from the mean
+  center and, when the database has `admin_level=4` region boundaries (stored by
+  `areas`), region concentration (location quotient, effective regions, Gini).
+  Writes one CSV row per name, most-scattered first, to a `<database>-kpi.csv`
+  file beside the database (`-o` overrides). The region KPIs are skipped with a
+  non-fatal warning when no region boundaries are stored.
+
 - **`alias`** (runs after `join`) — merges street-name variants the normalizer
   cannot catch (bad OSM data such as `carlomarx`, `karlmarx`, `marx`) using a
   hand-curated `old=new` file: it rewrites each variant `norm_name` in the
@@ -65,7 +74,7 @@ an optional positional argument.
 ### Technical decisions
 
 Use modern Python:
-- `uv` for dependecies, environment and run code
+- `uv` for dependecies, environment and run code or scripts
 - use type annotations and `ruff` to check and format
 - prefer pathlib
 - string generation with t-strings
@@ -104,6 +113,11 @@ If a edit change something written here, ask the user if he wants to update AGEN
 - `geometry.py` — `Projector` transforms WGS84 lon/lat to a metric projected
   CRS so distances are measured in meters (`transform_point` for a singl
   coordinate, used by `map`).
+- `stats.py` — the `kpi` command's pure aggregation and CSV rendering:
+  `compute_kpis` groups street points by `norm_name` and computes per-name
+  distribution KPIs (standard distance, plus region concentration/spread via
+  `RegionIndex` when `admin_level=4` boundaries are present), `write_csv` renders
+  the sorted rows. The CLI (`run_kpi`) streams the points and region boundaries.
 - `mapper.py` — the `map` command's pure aggregation and rendering: `build_grid`
   bins streets into a square metric grid and computes each cell's target share,
   and `render_map` draws the coloured grid to an image with matplotlib.

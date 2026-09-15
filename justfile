@@ -14,6 +14,9 @@ join *ARGS:
 map *ARGS:
   uv run strade map "$@"
 
+kpi *ARGS:
+  uv run strade kpi "$@"
+
 alias *ARGS:
   uv run strade alias "$@"
 

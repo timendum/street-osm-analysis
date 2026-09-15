@@ -1,11 +1,12 @@
 """Command-line interface for the Italian Street Extractor.
 
 Exposes the ``extract``, ``join``, ``threshold``, ``prefixes``, ``map``,
-``alias``, and ``cities`` subcommands, each with its own options. This module
-owns argument parsing (:func:`parse_args`), the derivation of default output
-paths (:func:`default_database_path`, :func:`default_map_output_path`), and the
-per-command orchestration (``run_extract`` / ``run_join`` / ``run_threshold`` /
-``run_prefixes`` / ``run_map`` / ``run_alias`` / ``run_cities``).
+``kpi``, ``alias``, and ``cities`` subcommands, each with its own options. This
+module owns argument parsing (:func:`parse_args`), the derivation of default
+output paths (:func:`default_database_path`, :func:`default_map_output_path`),
+and the per-command orchestration (``run_extract`` / ``run_join`` /
+``run_threshold`` / ``run_prefixes`` / ``run_map`` / ``run_kpi`` / ``run_alias``
+/ ``run_cities``).
 """
 
 from __future__ import annotations
@@ -36,10 +37,17 @@ from strade.joiner import (
     print_candidate_pairs,
 )
 from strade.mapper import build_grid, render_cities_map, render_map
-from strade.parser import parse_admin_areas, parse_highways, parse_squares
+from strade.parser import (
+    REGION_ADMIN_LEVEL,
+    parse_admin_areas,
+    parse_highways,
+    parse_squares,
+)
 from strade.patterns import PatternError, parse_pattern_file
 from strade.prefixes import format_counts, scan_first_words
 from strade.reporter import Reporter
+from strade.stats import RegionIndex, compute_kpis
+from strade.stats import write_csv as write_kpi_csv
 from strade.store import StreetWriter
 from strade.validation import InputError, validate_input
 
@@ -98,6 +106,14 @@ MAP_SUFFIX = ".png"
 
 # CSV suffix appended to the derived default `cities` output path.
 CITIES_SUFFIX = ".csv"
+
+# CSV suffix appended to the derived default `kpi` output path.
+KPI_SUFFIX = ".csv"
+
+# Default minimum street count for the `kpi` command: a name needs *more than*
+# this many streets to be scored, since a distribution measure over a couple of
+# points is noise.
+DEFAULT_KPI_MIN_COUNT = 20
 
 # Sentinel for `cities -m/--map` given without a path: parse_args replaces it
 # with the path derived from the database + pattern file. Distinct object so it
@@ -239,6 +255,24 @@ class CitiesOptions:
     verbosity: int  # reporter verbosity level (incremented per -v)
 
 
+@dataclass(frozen=True)
+class KpiOptions:
+    """Resolved options for the ``kpi`` command.
+
+    Reads the produced streets from a database that ``join`` has already
+    populated and, for every ``norm_name`` carried by more than ``min_count``
+    streets, computes distribution KPIs measuring how spread out its streets are
+    (starting with the standard distance from the name's mean center). Writes one
+    CSV row per scored name, sorted most-scattered first, to ``output_path``,
+    which defaults to the database path with a ``-kpi.csv`` suffix.
+    """
+
+    database_path: Path  # SQLite checkpoint produced by `extract` + `join`
+    min_count: int  # a name needs more than this many streets to be scored
+    output_path: Path  # CSV file to write
+    verbosity: int  # reporter verbosity level (incremented per -v)
+
+
 def default_alias_path(database_path: Path) -> Path:
     """Derive the default ``alias`` file path from the database path.
 
@@ -284,6 +318,17 @@ def default_cities_map_path(database_path: Path, pattern_path: Path) -> Path:
     return database_path.with_name(
         f"{database_path.stem}-{pattern_path.stem}{MAP_SUFFIX}"
     )
+
+
+def default_kpi_output_path(database_path: Path) -> Path:
+    """Derive the default ``kpi`` CSV path from the database path.
+
+    Appends ``-kpi.csv`` to the database file's stem, keeping the file in the
+    database's directory (``aosta.db`` -> ``aosta-kpi.csv``). The report covers
+    every scored name at once, so — unlike ``map``/``cities`` — the name carries
+    no per-target/per-pattern component.
+    """
+    return database_path.with_name(f"{database_path.stem}-kpi{KPI_SUFFIX}")
 
 
 def default_database_path(input_path: Path) -> Path:
@@ -514,6 +559,43 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # kpi: score each norm_name by how spread out its streets are.
+    kpi = subparsers.add_parser(
+        "kpi",
+        parents=[common],
+        help=(
+            "Score each street name by how unevenly its streets are spread: for "
+            "every norm_name above a count threshold, report the standard "
+            "distance of its streets from their mean center, most scattered "
+            "first, to a <database>-kpi.csv file beside the database."
+        ),
+    )
+    kpi.add_argument(
+        "database",
+        type=Path,
+        help="Path to the SQLite checkpoint produced by `extract` and `join`.",
+    )
+    kpi.add_argument(
+        "-n",
+        "--min-count",
+        dest="min_count",
+        metavar="N",
+        type=int,
+        default=DEFAULT_KPI_MIN_COUNT,
+        help=("Only score names carried by more than N streets (default: 20)."),
+    )
+    kpi.add_argument(
+        "-o",
+        "--output",
+        dest="output",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the CSV to write. Defaults to the database path with a "
+            "-kpi.csv suffix."
+        ),
+    )
+
     # alias: fold variant norm_name keys into canonical keys in a joined database.
     alias = subparsers.add_parser(
         "alias",
@@ -609,6 +691,7 @@ def parse_args(
     | MapOptions
     | AliasOptions
     | CitiesOptions
+    | KpiOptions
 ):
     """Parse command-line arguments into resolved options.
 
@@ -660,6 +743,15 @@ def parse_args(
             output_path=output,
             cell_km=args.cell,
             min_streets=args.min_streets,
+            verbosity=args.verbosity,
+        )
+
+    if args.command == "kpi":
+        output = args.output or default_kpi_output_path(args.database)
+        return KpiOptions(
+            database_path=args.database,
+            min_count=args.min_count,
+            output_path=output,
             verbosity=args.verbosity,
         )
 
@@ -1076,6 +1168,88 @@ def run_map(options: MapOptions, reporter: Reporter) -> int:
     return reporter.exit_code
 
 
+def run_kpi(options: KpiOptions, reporter: Reporter) -> int:
+    """Run the ``kpi`` command; returns the process exit code.
+
+    Streams the produced streets from the database as representative points via
+    :func:`~strade.store.read_street_points`, groups them by ``norm_name`` and
+    computes per-name distribution KPIs with :func:`~strade.stats.compute_kpis`
+    (the standard distance of each name's streets from their mean center, plus —
+    when the database carries ``admin_level=4`` region boundaries — the region
+    each name is most over-represented in), then writes one CSV row per scored
+    name — most scattered first — to ``options.output_path``.
+
+    The region-concentration KPI needs the region boundaries the ``areas``
+    command stores: this reads the ``admin_level=4`` boundaries from the database
+    into a :class:`~strade.stats.RegionIndex` and passes it to
+    :func:`~strade.stats.compute_kpis`. When no region boundaries are stored (the
+    ``areas`` command was never run, or a single-region dump), the region columns
+    are left blank and a warning notes the KPI was skipped — it is not fatal,
+    since the standard-distance KPI still stands.
+
+    Only names carried by more than ``options.min_count`` streets are scored,
+    since a spread measure over a few points is meaningless; a database on which
+    ``join`` has not run yields no points and an empty (header-only) report plus
+    a warning. Progress and the output path go to stderr via the reporter,
+    keeping stdout unused. The run terminates with ``0`` when no non-fatal
+    warnings were recorded, else a non-zero code.
+    """
+    reporter.progress(
+        f"kpi: scoring names carried by more than {options.min_count} street(s)"
+    )
+    # Read the admin_level=4 region boundaries (stored by `areas`) into a spatial
+    # index so each street can be placed in a region for the concentration KPI.
+    # Absent (areas never run, or a single-region dump) the KPI is skipped, not
+    # fatal: the standard-distance KPI does not need regions.
+    regions = RegionIndex(
+        [
+            area
+            for area in store.read_areas(options.database_path)
+            if area.admin_level == REGION_ADMIN_LEVEL
+        ]
+    )
+    if len(regions) == 0:
+        reporter.warn(
+            "no admin_level=4 region boundaries in "
+            f"{options.database_path}; region-concentration KPI skipped "
+            "(run `areas` to enable it)"
+        )
+        region_index: RegionIndex | None = None
+    else:
+        reporter.progress(f"kpi: placing streets in {len(regions)} region(s)")
+        region_index = regions
+    # street count sizes the bar; it is an upper bound since streets with no
+    # resolved coords are skipped by read_street_points. Drawn on stderr like
+    # the map/join bars.
+    total_streets = store.count_streets(options.database_path)
+    points = tqdm(
+        store.read_street_points(options.database_path),
+        desc="scoring streets",
+        total=total_streets,
+        unit="street",
+    )
+    kpis = compute_kpis(points, min_count=options.min_count, regions=region_index)
+
+    if total_streets == 0:
+        reporter.warn(
+            f"no streets found in {options.database_path}; "
+            "has `join` been run on this database?"
+        )
+    elif not kpis:
+        reporter.warn(
+            f"no name carried more than {options.min_count} street(s); "
+            "lower --min-count to score more names"
+        )
+
+    with options.output_path.open("w", encoding="utf-8", newline="") as stream:
+        rows = write_kpi_csv(kpis, stream)
+
+    reporter.progress(f"kpi: scored {rows} name(s) -> {options.output_path}")
+
+    # 0 when no non-fatal warnings were recorded, else non-zero.
+    return reporter.exit_code
+
+
 def run_alias(options: AliasOptions, reporter: Reporter) -> int:
     """Run the ``alias`` command; returns the process exit code.
 
@@ -1253,8 +1427,9 @@ def main(argv: list[str] | None = None) -> int:
     :class:`AreasOptions`, :func:`run_join` for :class:`JoinOptions`,
     :func:`run_threshold` for :class:`ThresholdOptions`, :func:`run_prefixes` for
     :class:`PrefixesOptions`, :func:`run_map` for :class:`MapOptions`,
-    :func:`run_alias` for :class:`AliasOptions`, or :func:`run_cities` for
-    :class:`CitiesOptions`. Returns the command's process exit code.
+    :func:`run_kpi` for :class:`KpiOptions`, :func:`run_alias` for
+    :class:`AliasOptions`, or :func:`run_cities` for :class:`CitiesOptions`.
+    Returns the command's process exit code.
     """
     try:
         options = parse_args(sys.argv[1:] if argv is None else argv)
@@ -1269,6 +1444,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_threshold(options, reporter)
         if isinstance(options, MapOptions):
             return run_map(options, reporter)
+        if isinstance(options, KpiOptions):
+            return run_kpi(options, reporter)
         if isinstance(options, AliasOptions):
             return run_alias(options, reporter)
         if isinstance(options, CitiesOptions):
