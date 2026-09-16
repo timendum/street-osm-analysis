@@ -22,9 +22,12 @@ parent levels (region/country) in the same pass, and given a parent boundary's
 OSM id it keeps only the comuni whose representative point falls inside that
 parent.
 
-The result is one CSV row per (kept) comune in the order the boundaries were
-read, carrying the identifying tags, the source OSM reference, and a
-``true``/``false`` ``matched`` column.
+The result is merged into a single ``<database>-cities.csv``: one row per comune
+carrying the identifying tags and the source OSM reference, plus one
+``true``/``false`` result column per pattern file (named after that file's
+stem). Re-running a pattern file overwrites its column; a new pattern file adds
+one, keyed on the comune's ``osm_id`` reference. A trailing ``Total`` row counts
+the matched comuni per result column.
 """
 
 from __future__ import annotations
@@ -39,7 +42,7 @@ from strade.parser import COMUNE_ADMIN_LEVEL
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
-    from typing import TextIO
+    from pathlib import Path
 
     from strade.models import CityArea
     from strade.reporter import Reporter
@@ -57,17 +60,17 @@ class RegionError(Exception):
     """
 
 
-# CSV header, one column per reported comune attribute plus the yes/no result.
+# The identifying columns every row carries, shared across pattern-file runs.
 # ``osm_id`` carries the source OSM element reference (e.g. ``relation/45690``)
-# so each row can be traced back to the boundary it came from.
-CSV_HEADER: tuple[str, ...] = (
+# so each row can be traced back to the boundary it came from; it is also the
+# stable per-comune id the merge keys on.
+ID_COLUMNS: tuple[str, ...] = (
     "name",
     "postal_code",
     "istat",
     "catasto",
     "wikidata",
     "osm_id",
-    "matched",
 )
 
 
@@ -226,41 +229,130 @@ def _cell(value: str | None) -> str:
     return "" if value is None else value
 
 
-def write_csv(matches: Iterable[CityMatch], stream: TextIO, region_id: int | None) -> int:
-    """Write one CSV row per comune to ``stream`` and return the rows written.
+def _row_key(row: dict[str, str]) -> str:
+    """Stable identity for a comune row: its ``osm_id`` reference.
 
-    Emits :data:`CSV_HEADER` first, then one row per :class:`CityMatch` in the
-    given order: the five identifying tags (empty when absent), the source OSM
-    reference (``relation/<id>`` or ``way/<id>``), and ``matched`` as the
-    lowercase literal ``true``/``false``. Uses :mod:`csv` so names containing
-    commas or quotes are quoted correctly.
+    Every comune carries a unique OSM element reference (``relation/<id>`` or
+    ``way/<id>``), so it is the reliable merge id: the same comune re-run always
+    yields the same reference. ``wikidata`` is not used because it is optional
+    and occasionally shared by two distinct comuni (bad OSM/wikidata data), which
+    would collapse them into one row.
     """
-    writer = csv.writer(stream, lineterminator="\n")
-    writer.writerow(CSV_HEADER)
-    rows = 0
+    return row.get("osm_id", "")
+
+
+def _match_rows(matches: Iterable[CityMatch], column: str) -> list[dict[str, str]]:
+    """Turn the match records into per-comune dicts carrying one result column.
+
+    Each dict holds the :data:`ID_COLUMNS` (empty string for an absent tag) plus
+    ``column`` set to the lowercase literal ``true``/``false``.
+    """
+    rows: list[dict[str, str]] = []
     for match in matches:
         area = match.area
-        writer.writerow(
-            (
-                _cell(area.name),
-                _cell(area.postal_code),
-                _cell(area.istat),
-                _cell(area.catasto),
-                _cell(area.wikidata),
-                area.osm_ref,
-                "true" if match.matched else "false",
-            )
+        rows.append(
+            {
+                "name": _cell(area.name),
+                "postal_code": _cell(area.postal_code),
+                "istat": _cell(area.istat),
+                "catasto": _cell(area.catasto),
+                "wikidata": _cell(area.wikidata),
+                "osm_id": area.osm_ref,
+                column: "true" if match.matched else "false",
+            }
         )
-        rows += 1
-    writer.writerow(
-        (
-            "Total",
-            "",
-            "",
-            "",
-            "",
-            str(region_id) if region_id else "",
-            sum(1 for m in matches if m.matched),
-        )
-    )
     return rows
+
+
+# The summary footer row is a normal keyed row carrying a fake ``osm_id`` so it
+# merges through the same ``osm_id``-keyed path as any comune (no comune uses
+# this id). ``name`` is set to ``Total`` for readability; its result cells hold
+# the per-column count of matched comuni, refreshed on every write.
+TOTAL_KEY = "total"
+TOTAL_LABEL = "Total"
+
+
+def _refresh_total(header: list[str], rows: Iterable[dict[str, str]]) -> dict[str, str]:
+    """Build the summary row: per-result-column count of ``true`` comune cells.
+
+    Keyed by the fake ``osm_id`` :data:`TOTAL_KEY`, labelled ``Total`` in the
+    ``name`` column with the other identifying columns blank, and each result
+    column set to its ``true`` count over the comuni (the summary row excluded).
+    """
+    result_columns = [col for col in header if col not in ID_COLUMNS]
+    comuni = [row for row in rows if _row_key(row) != TOTAL_KEY]
+    total: dict[str, str] = {"name": TOTAL_LABEL, "osm_id": TOTAL_KEY}
+    for col in result_columns:
+        total[col] = str(sum(1 for row in comuni if row.get(col) == "true"))
+    return total
+
+
+def _read_existing(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    """Read an existing ``cities`` CSV into its header and row dicts.
+
+    Returns the column order and one dict per data row (comuni plus, if present,
+    the :data:`TOTAL_KEY` summary row, which is just another keyed row here). A
+    missing file yields the bare :data:`ID_COLUMNS` header and no rows, so the
+    caller can treat "create" and "update" uniformly.
+    """
+    if not path.is_file():
+        return list(ID_COLUMNS), []
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        header = list(reader.fieldnames or ID_COLUMNS)
+        return header, [dict(row) for row in reader]
+
+
+def write_csv(matches: Iterable[CityMatch], path: Path, column: str) -> int:
+    """Merge the run's results into ``path`` under ``column`` and return the rows.
+
+    Builds a single ``<database>-cities.csv`` that grows one result column per
+    pattern file:
+
+    - If ``path`` does not exist, the file is created with the :data:`ID_COLUMNS`
+      followed by a single result column named ``column`` (the pattern file's
+      stem) -- the same shape the old report had, only the fixed ``matched``
+      header is replaced by the pattern name.
+    - If ``path`` exists, the run's per-comune ``true``/``false`` result is added
+      as a new ``column`` (or overwrites it when the same pattern file is re-run),
+      reusing every existing column. Rows are matched on the ``osm_id``
+      reference; comuni not already present are appended, and previously-seen
+      comuni missing from this run keep their old cells with an empty value in
+      the new column.
+
+    In both cases a trailing summary row (fake ``osm_id`` :data:`TOTAL_KEY`,
+    always sorted last) is refreshed to hold each result column's count of
+    matched (``true``) comuni.
+
+    Uses :mod:`csv` so names containing commas or quotes round-trip correctly.
+    Returns the number of comune rows this run contributed.
+    """
+    header, existing = _read_existing(path)
+    if column not in header:
+        header.append(column)
+
+    by_key = {_row_key(row): row for row in existing}
+    order = list(by_key)
+
+    new_rows = _match_rows(matches, column)
+    for row in new_rows:
+        key = _row_key(row)
+        if key in by_key:
+            by_key[key].update(row)
+        else:
+            by_key[key] = row
+            order.append(key)
+
+    # The summary row is just another keyed row: recompute its counts over the
+    # merged comuni and force it last, whether it pre-existed or is created here.
+    by_key[TOTAL_KEY] = _refresh_total(header, (by_key[key] for key in order))
+    order = [key for key in order if key != TOTAL_KEY] + [TOTAL_KEY]
+
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(
+            stream, fieldnames=header, restval="", lineterminator="\n"
+        )
+        writer.writeheader()
+        for key in order:
+            writer.writerow(by_key[key])
+    return len(new_rows)

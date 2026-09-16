@@ -295,17 +295,13 @@ def default_map_output_path(database_path: Path, target: str) -> Path:
     return database_path.with_name(f"{database_path.stem}-{target}{MAP_SUFFIX}")
 
 
-def default_cities_output_path(database_path: Path, pattern_path: Path) -> Path:
-    """Derive the ``cities`` CSV output path from the database and pattern file.
+def default_cities_output_path(database_path: Path) -> Path:
+    """Derive the shared ``cities`` CSV output path from the database.
 
-    Concatenates the database file's stem with the pattern file's stem and a
-    ``.csv`` extension, keeping the file in the database's directory, so running
-    different pattern files against one database yields distinct reports
-    (``aosta.db`` + ``name-roma.txt`` -> ``aosta-name-roma.csv``).
+    Appends ``-cities.csv`` to the database file's stem, keeping the file in the
+    database's directory (``aosta.db`` -> ``aosta-cities.csv``).
     """
-    return database_path.with_name(
-        f"{database_path.stem}-{pattern_path.stem}{CITIES_SUFFIX}"
-    )
+    return database_path.with_name(f"{database_path.stem}-cities{CITIES_SUFFIX}")
 
 
 def default_cities_map_path(database_path: Path, pattern_path: Path) -> Path:
@@ -1327,12 +1323,12 @@ def run_cities(options: CitiesOptions, reporter: Reporter) -> int:
     way falls in. It repeats the same match over the ``squares`` table
     (:func:`~strade.store.read_squares_matching`), so a comune counts as matched
     when either a highway way or a ``place=square`` (node/way/relation) with a
-    matching name falls inside it. Finally it writes one CSV row per comune to a
-    file named
-    ``<database>-<pattern_file>.csv`` beside the database (via
-    :func:`default_cities_output_path`) — the identifying tags plus a
-    ``true``/``false`` ``matched`` column — keeping all progress and warnings on
-    stderr via the reporter.
+    matching name falls inside it. Finally it merges the per-comune result into a
+    single ``<database>-cities.csv`` beside the database (via
+    :func:`default_cities_output_path`) — the identifying tags plus one
+    ``true``/``false`` column per pattern file, named after that file's stem and
+    keyed on each comune's ``osm_id`` reference — keeping all progress and
+    warnings on stderr via the reporter.
 
     A fatal input error (missing database, an unpopulated ``areas`` table, or an
     empty pattern file) is reported via the reporter and mapped to a non-zero
@@ -1391,9 +1387,8 @@ def run_cities(options: CitiesOptions, reporter: Reporter) -> int:
     matched_squares = store.read_squares_matching(options.database_path, patterns)
     consumed += assign_matches(index, matched_squares)
 
-    output_path = default_cities_output_path(options.database_path, options.pattern_path)
-    with output_path.open("w", encoding="utf-8", newline="") as stream:
-        rows = write_csv(index.matches, stream, options.region_id)
+    output_path = default_cities_output_path(options.database_path)
+    rows = write_csv(index.matches, output_path, options.pattern_path.stem)
 
     hit = sum(1 for match in index.matches if match.matched)
     reporter.progress(

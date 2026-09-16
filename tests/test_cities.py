@@ -163,7 +163,15 @@ class AssignMatchesTest(unittest.TestCase):
 
 
 class WriteCsvTest(unittest.TestCase):
-    def test_header_and_rows(self) -> None:
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = Path(self._dir.name) / "aosta-cities.csv"
+
+    def _lines(self) -> list[str]:
+        return self.path.read_text(encoding="utf-8").splitlines()
+
+    def test_creates_file_with_pattern_column(self) -> None:
         # A comma in the name forces the csv writer to quote the field.
         a = _city(
             "Reggio nell'Emilia, città",
@@ -179,14 +187,12 @@ class WriteCsvTest(unittest.TestCase):
         index = CityIndex([a, b])
         index.mark_point(0.5, 0.5)  # flags A only
 
-        out = io.StringIO()
-        rows = write_csv(index.matches, out, None)
-        lines = out.getvalue().splitlines()
+        rows = write_csv(index.matches, self.path, "roma")
+        lines = self._lines()
 
         self.assertEqual(rows, 2)
-        self.assertEqual(
-            lines[0], "name,postal_code,istat,catasto,wikidata,osm_id,matched"
-        )
+        # The result column is named after the pattern file, replacing `matched`.
+        self.assertEqual(lines[0], "name,postal_code,istat,catasto,wikidata,osm_id,roma")
         # A matched; the comma in the name forces quoting.
         self.assertEqual(
             lines[1],
@@ -194,25 +200,95 @@ class WriteCsvTest(unittest.TestCase):
         )
         # B did not match; absent tags render as empty fields.
         self.assertEqual(lines[2], "Bard,,007009,,,way/99,false")
-        self.assertEqual(lines[3], "Total,,,,,,1")
+        # A Total row closes the file: 1 matched comune in the roma column.
+        self.assertEqual(lines[3], "Total,,,,,total,1")
+
+    def test_second_pattern_adds_column_keyed_on_osm_id(self) -> None:
+        a = _city("Aosta", _square(0, 0, 1, 1), wikidata="Q1", osm_id="1")
+        index_a = CityIndex([a])
+        index_a.mark_point(0.5, 0.5)  # roma matches
+        write_csv(index_a.matches, self.path, "roma")
+
+        # A second run for a different pattern: same comune, no match this time.
+        index_b = CityIndex(
+            [_city("Aosta", _square(0, 0, 1, 1), wikidata="Q1", osm_id="1")]
+        )
+        write_csv(index_b.matches, self.path, "verdi")
+
+        lines = self._lines()
+        self.assertEqual(
+            lines[0], "name,postal_code,istat,catasto,wikidata,osm_id,roma,verdi"
+        )
+        # One comune row (merged on osm_id) carrying both results, plus Total.
+        self.assertEqual(lines[1], "Aosta,,,,Q1,relation/1,true,false")
+        self.assertEqual(lines[2], "Total,,,,,total,1,0")
+        self.assertEqual(len(lines), 3)  # header + comune + total
+
+    def test_shared_wikidata_stays_two_rows(self) -> None:
+        # Two distinct comuni sharing one wikidata id (bad OSM data) must not
+        # collapse: the osm_id key keeps them separate.
+        a = _city("Campli", _square(0, 0, 1, 1), wikidata="Q51426", osm_id="1")
+        b = _city("Torano", _square(2, 2, 3, 3), wikidata="Q51426", osm_id="2")
+        write_csv(CityIndex([a, b]).matches, self.path, "roma")
+
+        lines = self._lines()
+        self.assertEqual(len(lines), 4)  # header + 2 comuni + total
+        self.assertEqual(lines[1], "Campli,,,,Q51426,relation/1,false")
+        self.assertEqual(lines[2], "Torano,,,,Q51426,relation/2,false")
+        self.assertEqual(lines[3], "Total,,,,,total,0")
+
+    def test_rerun_same_pattern_overwrites_its_column(self) -> None:
+        a = _city("Aosta", _square(0, 0, 1, 1), wikidata="Q1", osm_id="1")
+        index_a = CityIndex([a])
+        index_a.mark_point(0.5, 0.5)  # first run: matched
+        write_csv(index_a.matches, self.path, "roma")
+
+        # Re-run the same pattern; this time nothing matches.
+        index_b = CityIndex(
+            [_city("Aosta", _square(0, 0, 1, 1), wikidata="Q1", osm_id="1")]
+        )
+        write_csv(index_b.matches, self.path, "roma")
+
+        lines = self._lines()
+        self.assertEqual(lines[0], "name,postal_code,istat,catasto,wikidata,osm_id,roma")
+        self.assertEqual(lines[1], "Aosta,,,,Q1,relation/1,false")
+
+    def test_new_comune_appended_missing_column_blank(self) -> None:
+        a = _city("Aosta", _square(0, 0, 1, 1), wikidata="Q1", osm_id="1")
+        write_csv(CityIndex([a]).matches, self.path, "roma")
+
+        # A second pattern run sees a comune the first run never did.
+        b = _city("Bard", _square(2, 2, 3, 3), wikidata="Q2", osm_id="2")
+        index_b = CityIndex([b])
+        index_b.mark_point(2.5, 2.5)  # verdi matches Bard
+        write_csv(index_b.matches, self.path, "verdi")
+
+        lines = self._lines()
+        self.assertEqual(
+            lines[0], "name,postal_code,istat,catasto,wikidata,osm_id,roma,verdi"
+        )
+        # Aosta keeps its roma cell and gets a blank verdi (absent from run 2).
+        self.assertEqual(lines[1], "Aosta,,,,Q1,relation/1,false,")
+        # Bard is appended with a blank roma (absent from run 1).
+        self.assertEqual(lines[2], "Bard,,,,Q2,relation/2,,true")
+        # Total stays last, counting each column over the comuni only.
+        self.assertEqual(lines[3], "Total,,,,,total,0,1")
 
     def test_name_without_comma_is_not_quoted(self) -> None:
         # A slash (Aosta / Aoste) is not a CSV special char, so no quoting.
         a = _city(
             "Aosta / Aoste", _square(0, 0, 1, 1), postal_code="11100", osm_id="45489"
         )
-        out = io.StringIO()
-        write_csv(CityIndex([a]).matches, out, None)
+        write_csv(CityIndex([a]).matches, self.path, "roma")
         self.assertEqual(
-            out.getvalue().splitlines()[1],
+            self._lines()[1],
             "Aosta / Aoste,11100,,,,relation/45489,false",
         )
 
     def test_none_name_renders_empty(self) -> None:
         c = _city("", _square(0, 0, 1, 1), osm_id="7")
-        out = io.StringIO()
-        write_csv(CityIndex([c]).matches, out, None)
-        self.assertEqual(out.getvalue().splitlines()[1], ",,,,,relation/7,false")
+        write_csv(CityIndex([c]).matches, self.path, "roma")
+        self.assertEqual(self._lines()[1], ",,,,,relation/7,false")
 
 
 class ReadWaysMatchingTest(unittest.TestCase):

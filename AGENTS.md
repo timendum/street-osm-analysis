@@ -67,14 +67,14 @@ an optional positional argument.
   comune, whether it contains at least one street or square whose
   name matches a file of SQLite `LIKE` patterns, via a point-in-polygon test
   against the comune boundaries. The boundaries are read from the `areas` table
-  in the database (populated by the `areas` command). Writes one CSV row per comune to a
-  `<database>-<pattern_file>.csv` file beside the database.  
+  in the database (populated by the `areas` command). Merges the result into a
+  shared `<database>-cities.csv` beside the database:.  
   An optional `-r/--region <osm_relation_id>` clips the report to a parent boundary (country `admin_level=2` / region `4`), dropping comuni that spill in from across the extract's cut; the hierarchy is hardcoded for Italy. 
 
 ### Technical decisions
 
 Use modern Python:
-- `uv` for dependecies, environment and run code or scripts
+- `uv` for dependencies, environment and run code or scripts
 - use type annotations and `ruff` to check and format
 - prefer pathlib
 - string generation with t-strings
@@ -134,9 +134,10 @@ If a edit change something written here, ask the user if he wants to update AGEN
   boundaries into comuni and parent (region/country) levels, optionally clipping
   to the comuni inside a `-r` parent, then wraps an STRtree over the kept comune
   boundaries for point-in-polygon lookup, flags each comune from the matched
-  way/square points, and renders one CSV row per comune. Point containment uses
-  the `intersects` predicate, since `STRtree.query` reads
-  `query_geom.predicate(tree_geom)`.
+  way/square points, and merges the run into `<database>-cities.csv` as a
+  pattern-named column (`write_csv`, keyed on `osm_id`, refreshing the `Total`
+  row). Point containment uses the `intersects` predicate, since `STRtree.query`
+  reads `query_geom.predicate(tree_geom)`.
 - `reporter.py` — non-fatal warning/progress sink and exit-code aggregation.
 - `validation.py` — input-path/format validation (`InputError`, `SupportedFormat`).
 
